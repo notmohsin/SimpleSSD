@@ -20,6 +20,7 @@
 #include "hil/nvme/controller.hh"
 
 #include <algorithm>
+#include <limits>
 #include <cmath>
 
 #include "hil/nvme/interface.hh"
