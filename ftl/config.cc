@@ -38,6 +38,10 @@ const char NAME_GC_RECLAIM_THRESHOLD[] = "GCReclaimThreshold";
 const char NAME_GC_EVICT_POLICY[] = "EvictPolicy";
 const char NAME_GC_D_CHOICE_PARAM[] = "DChoiceParam";
 const char NAME_USE_RANDOM_IO_TWEAK[] = "EnableRandomIOTweak";
+const char NAME_CMT_CAPACITY_RATIO[] = "CMTCapacityRatio";
+const char NAME_CMT_CAPACITY_BYTES[] = "CMTCapacityBytes";
+const char NAME_CMT_MISS_LATENCY[] = "CMTMissLatency";
+const char NAME_CMT_WRITEBACK_LATENCY[] = "CMTWriteBackLatency";
 
 Config::Config() {
   mapping = PAGE_MAPPING;
@@ -53,6 +57,10 @@ Config::Config() {
   evictPolicy = POLICY_GREEDY;
   dChoiceParam = 3;
   randomIOTweak = true;
+  cmtCapacityRatio = 0.01f;
+  cmtCapacityBytes = 2097152;   // 2MB → matches sample.cfg (262,144 entries, covers 1GB)
+  cmtMissLatency = 40000000;      // 40us — matches LSBRead for MLC NAND
+  cmtWriteBackLatency = 500000000; // 500us — matches LSBWrite for MLC NAND
 }
 
 bool Config::setConfig(const char *name, const char *value) {
@@ -96,6 +104,18 @@ bool Config::setConfig(const char *name, const char *value) {
   }
   else if (MATCH_NAME(NAME_USE_RANDOM_IO_TWEAK)) {
     randomIOTweak = convertBool(value);
+  }
+  else if (MATCH_NAME(NAME_CMT_CAPACITY_RATIO)) {
+    cmtCapacityRatio = strtof(value, nullptr);
+  }
+  else if (MATCH_NAME(NAME_CMT_CAPACITY_BYTES)) {
+    cmtCapacityBytes = strtoull(value, nullptr, 10);
+  }
+  else if (MATCH_NAME(NAME_CMT_MISS_LATENCY)) {
+    cmtMissLatency = strtoull(value, nullptr, 10);
+  }
+  else if (MATCH_NAME(NAME_CMT_WRITEBACK_LATENCY)) {
+    cmtWriteBackLatency = strtoull(value, nullptr, 10);
   }
   else {
     ret = false;
@@ -156,6 +176,15 @@ uint64_t Config::readUint(uint32_t idx) {
     case FTL_GC_D_CHOICE_PARAM:
       ret = dChoiceParam;
       break;
+    case FTL_CMT_CAPACITY_BYTES:
+      ret = cmtCapacityBytes;
+      break;
+    case FTL_CMT_MISS_LATENCY:
+      ret = cmtMissLatency;
+      break;
+    case FTL_CMT_WRITEBACK_LATENCY:
+      ret = cmtWriteBackLatency;
+      break;
   }
 
   return ret;
@@ -179,6 +208,9 @@ float Config::readFloat(uint32_t idx) {
       break;
     case FTL_GC_RECLAIM_THRESHOLD:
       ret = reclaimThreshold;
+      break;
+    case FTL_CMT_CAPACITY_RATIO:
+      ret = cmtCapacityRatio;
       break;
   }
 

@@ -21,6 +21,7 @@
 #define __FTL_PAGE_MAPPING__
 
 #include <cinttypes>
+#include <list>
 #include <unordered_map>
 #include <vector>
 
@@ -52,11 +53,49 @@ class PageMapping : public AbstractFTL {
   bool bRandomTweak;
   uint32_t bitsetSize;
 
+  // ── CMT (Cached Mapping Table) ─────────────────────────────
+  // Implements a size-limited LRU cache on top of the GMT (table).
+  // Simulates the SRAM mapping cache inside a real SSD controller.
+
+  struct CMTEntry {
+    std::vector<std::pair<uint32_t, uint32_t>> mapping;  // physical (block, page)
+    bool dirty;  // true if modified while in cache (needs write-back on eviction)
+  };
+
+  uint64_t cmtCapacity;  // max entries in cache — set in constructor
+  uint64_t cmtMissLatency;       // NAND read latency on CMT miss (ps)
+  uint64_t cmtWriteBackLatency;  // NAND program latency on dirty eviction (ps)
+
+  // LRU ordering: front = most recently used, back = least recently used
+  std::list<uint64_t> cmtOrder;
+
+  // CMT store: LPN → {CMTEntry, iterator into cmtOrder for O(1) LRU update}
+  std::unordered_map<uint64_t,
+    std::pair<CMTEntry, std::list<uint64_t>::iterator>> cmt;
+
+  // CMT access function — call instead of table.find() for all reads/writes
+  std::vector<std::pair<uint32_t, uint32_t>> &accessCMT(uint64_t lpn,
+                                                          bool isWrite,
+                                                          uint64_t &tick,
+                                                          bool isGC = false);
+
+  // Flush all dirty CMT entries back to GMT and clear the cache.
+  // Called at destruction to keep GMT coherent after simulation.
+  void flushCMT();
+
   struct {
     uint64_t gcCount;
     uint64_t reclaimedBlocks;
     uint64_t validSuperPageCopies;
     uint64_t validPageCopies;
+    // ── NEW: CMT statistics ────────────────────
+    uint64_t cmtHits;           // user lookups served from CMT (fast path)
+    uint64_t cmtMisses;         // user lookups that required reading from GMT
+    uint64_t cmtEvictions;      // total entries evicted from CMT
+    uint64_t cmtDirtyEvictions; // evictions that required write-back to GMT
+    uint64_t cmtWritebacks;     // total write-back operations to GMT
+    uint64_t cmtGCHits;         // GC-triggered lookups served from CMT
+    uint64_t cmtGCMisses;       // GC-triggered lookups that required GMT read
   } stat;
 
   float freeBlockRatio();

@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <list>
 #include <random>
 
 #include "util/algorithm.hh"
@@ -60,9 +61,42 @@ PageMapping::PageMapping(ConfigReader &c, Parameter &p, PAL::PAL *l,
 
   bRandomTweak = conf.readBoolean(CONFIG_FTL, FTL_USE_RANDOM_IO_TWEAK);
   bitsetSize = bRandomTweak ? param.ioUnitInPage : 1;
+
+  float cmtRatio = conf.readFloat(CONFIG_FTL, FTL_CMT_CAPACITY_RATIO);
+  if (cmtRatio > 0.0f) {
+    cmtCapacity = (uint64_t)((float)status.totalLogicalPages * cmtRatio);
+  }
+  else {
+    uint64_t cmtBytes = conf.readUint(CONFIG_FTL, FTL_CMT_CAPACITY_BYTES);
+    // DFTL paper: each mapping entry is 4B LPN + 4B PPN = 8 bytes
+    cmtCapacity = cmtBytes / 8;
+  }
+  if (cmtCapacity < 16) cmtCapacity = 16;
+
+  // DFTL "double read" penalty: NAND flash read latency on CMT miss
+  cmtMissLatency = conf.readUint(CONFIG_FTL, FTL_CMT_MISS_LATENCY);
+  // NAND flash program latency for dirty write-back on eviction
+  cmtWriteBackLatency = conf.readUint(CONFIG_FTL, FTL_CMT_WRITEBACK_LATENCY);
 }
 
-PageMapping::~PageMapping() {}
+PageMapping::~PageMapping() {
+  // Flush any remaining dirty CMT entries back to GMT so the mapping
+  // table is coherent if inspected after simulation ends.
+  flushCMT();
+}
+
+void PageMapping::flushCMT() {
+  // Write back every dirty CMT entry to the GMT (table) so the on-disk
+  // mapping is coherent after the simulation finishes.  Clean entries are
+  // already up-to-date in GMT and need no action.
+  for (auto &entry : cmt) {
+    if (entry.second.first.dirty) {
+      table[entry.first] = entry.second.first.mapping;
+    }
+  }
+  cmt.clear();
+  cmtOrder.clear();
+}
 
 bool PageMapping::initialize() {
   uint64_t nPagesToWarmup;
@@ -255,6 +289,14 @@ void PageMapping::format(LPNRange &range, uint64_t &tick) {
 
         // Collect block indices
         list.push_back(mapping.first);
+      }
+
+      // Bug fix: also evict from CMT so a subsequent access to this
+      // LPN does not get a stale hit after the GMT entry is erased.
+      auto cmtIt = cmt.find(iter->first);
+      if (cmtIt != cmt.end()) {
+        cmtOrder.erase(cmtIt->second.second);
+        cmt.erase(cmtIt);
       }
 
       iter = table.erase(iter);
@@ -541,15 +583,9 @@ void PageMapping::doGarbageCollection(std::vector<uint32_t> &blocksToReclaim,
             // Invalidate
             block->second.invalidate(pageIndex, idx);
 
-            auto mappingList = table.find(lpns.at(idx));
-
-            if (mappingList == table.end()) {
-              panic("Invalid mapping table entry");
-            }
-
-            pDRAM->read(&(*mappingList), 8 * param.ioUnitInPage, tick);
-
-            auto &mapping = mappingList->second.at(idx);
+            // GC also updates mappings — go through CMT for consistency
+            auto &gcMappingData = accessCMT(lpns.at(idx), true, tick, true);
+            auto &mapping = gcMappingData.at(idx);
 
             uint32_t newPageIdx = freeBlock->second.getNextWritePageIndex(idx);
 
@@ -614,8 +650,106 @@ void PageMapping::doGarbageCollection(std::vector<uint32_t> &blocksToReclaim,
     eraseFinishedAt = MAX(eraseFinishedAt, beginAt);
   }
 
-  tick = MAX(writeFinishedAt, eraseFinishedAt);
+    tick = MAX(writeFinishedAt, eraseFinishedAt);
   tick += applyLatency(CPU::FTL__PAGE_MAPPING, CPU::DO_GARBAGE_COLLECTION);
+}
+
+std::vector<std::pair<uint32_t, uint32_t>> &
+PageMapping::accessCMT(uint64_t lpn, bool isWrite, uint64_t &tick, bool isGC) {
+  auto it = cmt.find(lpn);
+
+  // ────────────────────────────────────────────────
+  // CACHE HIT — LPN is already in the CMT
+  // ────────────────────────────────────────────────
+  if (it != cmt.end()) {
+    // Separate GC hits from user hits
+    if (isGC) {
+      stat.cmtGCHits++;
+    } else {
+      stat.cmtHits++;
+    }
+
+    // Move to front of LRU list (most recently used)
+    cmtOrder.splice(cmtOrder.begin(), cmtOrder, it->second.second);
+
+    // Mark dirty if this is a write — needs write-back on eviction
+    if (isWrite) {
+      it->second.first.dirty = true;
+    }
+
+    return it->second.first.mapping;
+  }
+
+  // ────────────────────────────────────────────────
+  // CACHE MISS — LPN is not in CMT
+  // ────────────────────────────────────────────────
+  // Separate GC misses from user misses
+  if (isGC) {
+    stat.cmtGCMisses++;
+  } else {
+    stat.cmtMisses++;
+  }
+
+  // Edge Case 1: CMT is full — evict the LRU entry (back of list)
+  if (cmt.size() >= cmtCapacity) {
+    uint64_t evictLpn = cmtOrder.back();
+
+    // Bug fix: find the map entry BEFORE popping the list so that if the
+    // list and map ever de-sync we do not silently lose a pop without
+    // counting the eviction (and without writing back a dirty entry).
+    auto evictIt = cmt.find(evictLpn);
+    if (evictIt != cmt.end()) {
+      cmtOrder.pop_back();  // only pop once we know the entry is valid
+      stat.cmtEvictions++;
+
+      // Edge Case 2: Evicted entry is dirty — write back to GMT first
+      // Without this, the GMT has stale data and future misses load wrong mappings
+      if (evictIt->second.first.dirty) {
+        table[evictLpn] = evictIt->second.first.mapping;
+        stat.cmtDirtyEvictions++;
+        stat.cmtWritebacks++;
+
+        // V2 FIX: Dirty write-back requires a NAND flash program operation
+        // (DFTL paper: writing a translation page back to flash)
+        tick += cmtWriteBackLatency;
+      }
+
+      cmt.erase(evictIt);
+    }
+  }
+
+  // Load from GMT (the existing full mapping table)
+  auto gmtIt = table.find(lpn);
+
+  // Edge Case 3: Brand-new LPN — never written before, not in GMT either
+  // This happens on the very first write to a logical page
+  if (gmtIt == table.end()) {
+    auto ret = table.emplace(
+        lpn,
+        std::vector<std::pair<uint32_t, uint32_t>>(
+            bitsetSize, {param.totalPhysicalBlocks, param.pagesInBlock}));
+
+    if (!ret.second) {
+      panic("CMT: Failed to create new GMT entry for LPN");
+    }
+
+    gmtIt = ret.first;
+    // No flash read penalty for brand-new pages — nothing to load from NAND
+  }
+  else {
+    // Edge Case 4: Existing LPN fetched from GMT
+    // V2 FIX: DFTL "double read" — reading translation page from NAND flash
+    // This replaces the incorrect DRAM read that was 500x too cheap
+    tick += cmtMissLatency;
+  }
+
+  // Insert into CMT at front of LRU list (most recently used)
+  cmtOrder.push_front(lpn);
+  auto insertResult = cmt.emplace(
+      lpn,
+      std::make_pair(CMTEntry{gmtIt->second, isWrite}, cmtOrder.begin()));
+
+  return insertResult.first->second.first.mapping;
 }
 
 void PageMapping::readInternal(Request &req, uint64_t &tick) {
@@ -623,19 +757,29 @@ void PageMapping::readInternal(Request &req, uint64_t &tick) {
   uint64_t beginAt;
   uint64_t finishedAt = tick;
 
-  auto mappingList = table.find(req.lpn);
+  // ── CMT lookup (replaces direct table.find) ──────────────
+  auto &mappingData = accessCMT(req.lpn, false, tick);
 
-  if (mappingList != table.end()) {
+  // Check if there is actually a valid mapping (non-empty)
+  bool hasValidMapping = false;
+  for (uint32_t idx = 0; idx < bitsetSize; idx++) {
+    if (mappingData.at(idx).first < param.totalPhysicalBlocks) {
+      hasValidMapping = true;
+      break;
+    }
+  }
+
+  if (hasValidMapping) {
     if (bRandomTweak) {
-      pDRAM->read(&(*mappingList), 8 * req.ioFlag.count(), tick);
+      pDRAM->read(&mappingData, 8 * req.ioFlag.count(), tick);
     }
     else {
-      pDRAM->read(&(*mappingList), 8, tick);
+      pDRAM->read(&mappingData, 8, tick);
     }
 
     for (uint32_t idx = 0; idx < bitsetSize; idx++) {
       if (req.ioFlag.test(idx) || !bRandomTweak) {
-        auto &mapping = mappingList->second.at(idx);
+        auto &mapping = mappingData.at(idx);
 
         if (mapping.first < param.totalPhysicalBlocks &&
             mapping.second < param.pagesInBlock) {
@@ -674,15 +818,26 @@ void PageMapping::readInternal(Request &req, uint64_t &tick) {
 void PageMapping::writeInternal(Request &req, uint64_t &tick, bool sendToPAL) {
   PAL::Request palRequest(req);
   std::unordered_map<uint32_t, Block>::iterator block;
-  auto mappingList = table.find(req.lpn);
   uint64_t beginAt;
   uint64_t finishedAt = tick;
   bool readBeforeWrite = false;
 
-  if (mappingList != table.end()) {
+  // ── CMT lookup — isWrite=true marks entry dirty immediately ──
+  auto &mappingData = accessCMT(req.lpn, true, tick);
+
+  // Check if a previous mapping already exists
+  bool hadPreviousMapping = false;
+  for (uint32_t idx = 0; idx < bitsetSize; idx++) {
+    if (mappingData.at(idx).first < param.totalPhysicalBlocks) {
+      hadPreviousMapping = true;
+      break;
+    }
+  }
+
+  if (hadPreviousMapping) {
     for (uint32_t idx = 0; idx < bitsetSize; idx++) {
       if (req.ioFlag.test(idx) || !bRandomTweak) {
-        auto &mapping = mappingList->second.at(idx);
+        auto &mapping = mappingData.at(idx);
 
         if (mapping.first < param.totalPhysicalBlocks &&
             mapping.second < param.pagesInBlock) {
@@ -694,19 +849,6 @@ void PageMapping::writeInternal(Request &req, uint64_t &tick, bool sendToPAL) {
       }
     }
   }
-  else {
-    // Create empty mapping
-    auto ret = table.emplace(
-        req.lpn,
-        std::vector<std::pair<uint32_t, uint32_t>>(
-            bitsetSize, {param.totalPhysicalBlocks, param.pagesInBlock}));
-
-    if (!ret.second) {
-      panic("Failed to insert new mapping");
-    }
-
-    mappingList = ret.first;
-  }
 
   // Write data to free block
   block = blocks.find(getLastFreeBlock(req.ioFlag));
@@ -717,12 +859,12 @@ void PageMapping::writeInternal(Request &req, uint64_t &tick, bool sendToPAL) {
 
   if (sendToPAL) {
     if (bRandomTweak) {
-      pDRAM->read(&(*mappingList), 8 * req.ioFlag.count(), tick);
-      pDRAM->write(&(*mappingList), 8 * req.ioFlag.count(), tick);
+      pDRAM->read(&mappingData, 8 * req.ioFlag.count(), tick);
+      pDRAM->write(&mappingData, 8 * req.ioFlag.count(), tick);
     }
     else {
-      pDRAM->read(&(*mappingList), 8, tick);
-      pDRAM->write(&(*mappingList), 8, tick);
+      pDRAM->read(&mappingData, 8, tick);
+      pDRAM->write(&mappingData, 8, tick);
     }
   }
 
@@ -734,7 +876,7 @@ void PageMapping::writeInternal(Request &req, uint64_t &tick, bool sendToPAL) {
   for (uint32_t idx = 0; idx < bitsetSize; idx++) {
     if (req.ioFlag.test(idx) || !bRandomTweak) {
       uint32_t pageIndex = block->second.getNextWritePageIndex(idx);
-      auto &mapping = mappingList->second.at(idx);
+      auto &mapping = mappingData.at(idx);
 
       beginAt = tick;
 
@@ -812,19 +954,21 @@ void PageMapping::writeInternal(Request &req, uint64_t &tick, bool sendToPAL) {
 }
 
 void PageMapping::trimInternal(Request &req, uint64_t &tick) {
-  auto mappingList = table.find(req.lpn);
+  // For trim, use accessCMT to ensure consistent cache state
+  auto &mappingData = accessCMT(req.lpn, false, tick);
+  bool hasMappingData = mappingData.at(0).first < param.totalPhysicalBlocks;
 
-  if (mappingList != table.end()) {
+  if (hasMappingData) {
     if (bRandomTweak) {
-      pDRAM->read(&(*mappingList), 8 * req.ioFlag.count(), tick);
+      pDRAM->read(&mappingData, 8 * req.ioFlag.count(), tick);
     }
     else {
-      pDRAM->read(&(*mappingList), 8, tick);
+      pDRAM->read(&mappingData, 8, tick);
     }
 
     // Do trim
     for (uint32_t idx = 0; idx < bitsetSize; idx++) {
-      auto &mapping = mappingList->second.at(idx);
+      auto &mapping = mappingData.at(idx);
       auto block = blocks.find(mapping.first);
 
       if (block == blocks.end()) {
@@ -834,8 +978,14 @@ void PageMapping::trimInternal(Request &req, uint64_t &tick) {
       block->second.invalidate(mapping.second, idx);
     }
 
-    // Remove mapping
-    table.erase(mappingList);
+    // Remove from CMT — this LPN is now invalid
+    auto cmtIt = cmt.find(req.lpn);
+    if (cmtIt != cmt.end()) {
+      cmtOrder.erase(cmtIt->second.second);
+      cmt.erase(cmtIt);
+    }
+    // Remove from GMT
+    table.erase(req.lpn);
 
     tick += applyLatency(CPU::FTL__PAGE_MAPPING, CPU::TRIM_INTERNAL);
   }
@@ -962,6 +1112,46 @@ void PageMapping::getStatList(std::vector<Stats> &list, std::string prefix) {
   temp.name = prefix + "page_mapping.wear_leveling";
   temp.desc = "Wear-leveling factor";
   list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.cmt.hits";
+  temp.desc = "User mapping cache hits (CMT)";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.cmt.misses";
+  temp.desc = "User mapping cache misses (CMT)";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.cmt.hit_rate";
+  temp.desc = "User mapping cache hit rate % (CMT, excludes GC)";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.cmt.evictions";
+  temp.desc = "Total CMT evictions";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.cmt.dirty_evictions";
+  temp.desc = "CMT dirty evictions (required write-back to GMT)";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.cmt.writebacks";
+  temp.desc = "Total GMT write-back operations";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.cmt.gc_hits";
+  temp.desc = "GC-triggered mapping cache hits (CMT)";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.cmt.gc_misses";
+  temp.desc = "GC-triggered mapping cache misses (CMT)";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.cmt.capacity";
+  temp.desc = "CMT capacity (max entries in cache)";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.cmt.occupancy";
+  temp.desc = "CMT occupancy at end of simulation (entries used)";
+  list.push_back(temp);
 }
 
 void PageMapping::getStatValues(std::vector<double> &values) {
@@ -970,6 +1160,23 @@ void PageMapping::getStatValues(std::vector<double> &values) {
   values.push_back(stat.validSuperPageCopies);
   values.push_back(stat.validPageCopies);
   values.push_back(calculateWearLeveling());
+
+  // User-facing hit rate (excludes GC-triggered accesses)
+  uint64_t totalLookups = stat.cmtHits + stat.cmtMisses;
+  double hitRate = totalLookups > 0
+      ? (double)stat.cmtHits / (double)totalLookups * 100.0
+      : 0.0;
+
+  values.push_back((double)stat.cmtHits);
+  values.push_back((double)stat.cmtMisses);
+  values.push_back(hitRate);
+  values.push_back((double)stat.cmtEvictions);
+  values.push_back((double)stat.cmtDirtyEvictions);
+  values.push_back((double)stat.cmtWritebacks);
+  values.push_back((double)stat.cmtGCHits);
+  values.push_back((double)stat.cmtGCMisses);
+  values.push_back((double)cmtCapacity);
+  values.push_back((double)cmt.size());
 }
 
 void PageMapping::resetStatValues() {

@@ -41,7 +41,6 @@ void HIL::read(Request &req) {
   DMAFunction doRead = [this](uint64_t beginAt, void *context) {
     auto pReq = (Request *)context;
     uint64_t tick = beginAt;
-
     pReq->reqID = ++reqCount;
 
     debugprint(LOG_HIL,
