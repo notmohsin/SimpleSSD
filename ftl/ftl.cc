@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2017 CAMELab
+ * Copyright (C) 2017 1
  *
  * This file is part of SimpleSSD.
  *

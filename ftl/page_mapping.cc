@@ -62,14 +62,22 @@ PageMapping::PageMapping(ConfigReader &c, Parameter &p, PAL::PAL *l,
   bRandomTweak = conf.readBoolean(CONFIG_FTL, FTL_USE_RANDOM_IO_TWEAK);
   bitsetSize = bRandomTweak ? param.ioUnitInPage : 1;
 
+  cmtPolicy = (CMT_POLICY)conf.readInt(CONFIG_FTL, FTL_CMT_POLICY);
+
+  // One CMT entry caches the mapping for a whole superpage, which is
+  // bitsetSize sub-page mappings of 8 bytes each (4B LPN + 4B PPN, as in the
+  // DFTL paper).  Sizing the cache by bytes therefore has to account for
+  // bitsetSize, otherwise a "2 MB" cache silently holds bitsetSize times as
+  // much mapping data as its label claims.
+  cmtEntryBytes = 8 * bitsetSize;
+
   float cmtRatio = conf.readFloat(CONFIG_FTL, FTL_CMT_CAPACITY_RATIO);
   if (cmtRatio > 0.0f) {
     cmtCapacity = (uint64_t)((float)status.totalLogicalPages * cmtRatio);
   }
   else {
     uint64_t cmtBytes = conf.readUint(CONFIG_FTL, FTL_CMT_CAPACITY_BYTES);
-    // DFTL paper: each mapping entry is 4B LPN + 4B PPN = 8 bytes
-    cmtCapacity = cmtBytes / 8;
+    cmtCapacity = cmtBytes / cmtEntryBytes;
   }
   if (cmtCapacity < 16) cmtCapacity = 16;
 
@@ -77,6 +85,13 @@ PageMapping::PageMapping(ConfigReader &c, Parameter &p, PAL::PAL *l,
   cmtMissLatency = conf.readUint(CONFIG_FTL, FTL_CMT_MISS_LATENCY);
   // NAND flash program latency for dirty write-back on eviction
   cmtWriteBackLatency = conf.readUint(CONFIG_FTL, FTL_CMT_WRITEBACK_LATENCY);
+  cmtMinFreq = 0;
+
+  debugprint(LOG_FTL_PAGE_MAPPING,
+             "CMT  | Policy %s | %" PRIu64 " entries | %" PRIu64
+             " B/entry (bitsetSize %u) | %" PRIu64 " B total",
+             cmtPolicy == CMT_POLICY_LFU ? "LFU" : "LRU", cmtCapacity,
+             cmtEntryBytes, bitsetSize, cmtCapacity * cmtEntryBytes);
 }
 
 PageMapping::~PageMapping() {
@@ -89,13 +104,120 @@ void PageMapping::flushCMT() {
   // Write back every dirty CMT entry to the GMT (table) so the on-disk
   // mapping is coherent after the simulation finishes.  Clean entries are
   // already up-to-date in GMT and need no action.
-  for (auto &entry : cmt) {
-    if (entry.second.first.dirty) {
-      table[entry.first] = entry.second.first.mapping;
+  if (cmtPolicy == CMT_POLICY_LFU) {
+    for (auto &entry : cmtLFU) {
+      if (entry.second.dirty) {
+        table[entry.first] = entry.second.mapping;
+      }
     }
   }
+  else {
+    for (auto &entry : cmt) {
+      if (entry.second.first.dirty) {
+        table[entry.first] = entry.second.first.mapping;
+      }
+    }
+  }
+
   cmt.clear();
   cmtOrder.clear();
+  cmtLFU.clear();
+  cmtFreqBuckets.clear();
+  cmtMinFreq = 0;
+}
+
+void PageMapping::repairLFUMinFreq() {
+  if (cmtFreqBuckets.empty()) {
+    cmtMinFreq = 0;
+    return;
+  }
+
+  cmtMinFreq = cmtFreqBuckets.begin()->first;
+
+  for (const auto &bucket : cmtFreqBuckets) {
+    if (bucket.first < cmtMinFreq) {
+      cmtMinFreq = bucket.first;
+    }
+  }
+}
+
+void PageMapping::cmtErase(uint64_t lpn) {
+  // Drop an LPN whose mapping no longer exists.  No write-back: the caller is
+  // destroying the mapping, so pushing it to the GMT would resurrect it.
+  if (cmtPolicy == CMT_POLICY_LFU) {
+    auto iter = cmtLFU.find(lpn);
+
+    if (iter != cmtLFU.end()) {
+      uint64_t freq = iter->second.freq;
+      auto bucket = cmtFreqBuckets.find(freq);
+
+      if (bucket != cmtFreqBuckets.end()) {
+        bucket->second.erase(iter->second.listIt);
+
+        if (bucket->second.empty()) {
+          cmtFreqBuckets.erase(bucket);
+
+          // Eviction reads cmtFreqBuckets[cmtMinFreq].  If we just emptied
+          // that bucket, leave the pointer on a real occupied frequency.
+          if (freq == cmtMinFreq) {
+            repairLFUMinFreq();
+          }
+        }
+      }
+
+      cmtLFU.erase(iter);
+    }
+  }
+  else {
+    auto iter = cmt.find(lpn);
+
+    if (iter != cmt.end()) {
+      cmtOrder.erase(iter->second.second);
+      cmt.erase(iter);
+    }
+  }
+}
+
+std::vector<std::pair<uint32_t, uint32_t>> *PageMapping::getLiveMapping(
+    uint64_t lpn) {
+  // Prefer the CMT copy: writes update CMT and mark dirty, so GMT may still
+  // hold a sentinel or a previous PPN until the next dirty eviction.
+  if (cmtPolicy == CMT_POLICY_LFU) {
+    auto it = cmtLFU.find(lpn);
+
+    if (it != cmtLFU.end()) {
+      return &it->second.mapping;
+    }
+  }
+  else {
+    auto it = cmt.find(lpn);
+
+    if (it != cmt.end()) {
+      return &it->second.first.mapping;
+    }
+  }
+
+  auto gmtIt = table.find(lpn);
+
+  if (gmtIt == table.end()) {
+    return nullptr;
+  }
+
+  return &gmtIt->second;
+}
+
+uint64_t PageMapping::cmtSize() const {
+  return cmtPolicy == CMT_POLICY_LFU ? cmtLFU.size() : cmt.size();
+}
+
+void PageMapping::resetCMTStats() {
+  stat.cmtHits = 0;
+  stat.cmtMisses = 0;
+  stat.cmtEvictions = 0;
+  stat.cmtDirtyEvictions = 0;
+  stat.cmtWritebacks = 0;
+  stat.cmtGCHits = 0;
+  stat.cmtGCMisses = 0;
 }
 
 bool PageMapping::initialize() {
@@ -212,6 +334,17 @@ bool PageMapping::initialize() {
              " (%.2f %%, target: %" PRIu64 ", error: %" PRId64 ")",
              invalid, invalid * 100.f / nTotalLogicalPages, nPagesToInvalidate,
              (int64_t)(invalid - nPagesToInvalidate));
+
+  // Warm-up drove millions of writes through the CMT, every one of them a
+  // compulsory miss.  Leaving those in the counters buries the measured
+  // workload's hit rate, so zero the CMT counters here.  Cache *contents*
+  // stay warm, which is what a real drive would look like at this point.
+  debugprint(LOG_FTL_PAGE_MAPPING,
+             "CMT  | Warm-up | %" PRIu64 " hits, %" PRIu64
+             " misses discarded | %" PRIu64 " entries resident",
+             stat.cmtHits, stat.cmtMisses, cmtSize());
+  resetCMTStats();
+
   debugprint(LOG_FTL_PAGE_MAPPING, "Initialization finished");
 
   return true;
@@ -274,11 +407,24 @@ void PageMapping::format(LPNRange &range, uint64_t &tick) {
 
   for (auto iter = table.begin(); iter != table.end();) {
     if (iter->first >= range.slpn && iter->first < range.slpn + range.nlp) {
-      auto &mappingList = iter->second;
+      // Use the live mapping (CMT if dirty/resident, else GMT).  GMT alone
+      // can still hold the allocate sentinel or a pre-writeback PPN, which
+      // would panic or invalidate the wrong page.
+      auto *mappingList = getLiveMapping(iter->first);
+
+      if (mappingList == nullptr) {
+        mappingList = &iter->second;
+      }
 
       // Do trim
       for (uint32_t idx = 0; idx < bitsetSize; idx++) {
-        auto &mapping = mappingList.at(idx);
+        auto &mapping = mappingList->at(idx);
+
+        // Skip never-mapped sub-pages (sentinel block index).
+        if (mapping.first >= param.totalPhysicalBlocks) {
+          continue;
+        }
+
         auto block = blocks.find(mapping.first);
 
         if (block == blocks.end()) {
@@ -291,13 +437,9 @@ void PageMapping::format(LPNRange &range, uint64_t &tick) {
         list.push_back(mapping.first);
       }
 
-      // Bug fix: also evict from CMT so a subsequent access to this
-      // LPN does not get a stale hit after the GMT entry is erased.
-      auto cmtIt = cmt.find(iter->first);
-      if (cmtIt != cmt.end()) {
-        cmtOrder.erase(cmtIt->second.second);
-        cmt.erase(cmtIt);
-      }
+      // Drop the cache entry without write-back — the mapping is being
+      // destroyed, so pushing it back to GMT would resurrect it.
+      cmtErase(iter->first);
 
       iter = table.erase(iter);
     }
@@ -584,7 +726,7 @@ void PageMapping::doGarbageCollection(std::vector<uint32_t> &blocksToReclaim,
             block->second.invalidate(pageIndex, idx);
 
             // GC also updates mappings — go through CMT for consistency
-            auto &gcMappingData = accessCMT(lpns.at(idx), true, tick, true);
+            auto &gcMappingData = *accessCMT(lpns.at(idx), true, tick, true);
             auto &mapping = gcMappingData.at(idx);
 
             uint32_t newPageIdx = freeBlock->second.getNextWritePageIndex(idx);
@@ -654,8 +796,26 @@ void PageMapping::doGarbageCollection(std::vector<uint32_t> &blocksToReclaim,
   tick += applyLatency(CPU::FTL__PAGE_MAPPING, CPU::DO_GARBAGE_COLLECTION);
 }
 
-std::vector<std::pair<uint32_t, uint32_t>> &
-PageMapping::accessCMT(uint64_t lpn, bool isWrite, uint64_t &tick, bool isGC) {
+std::vector<std::pair<uint32_t, uint32_t>> *
+PageMapping::accessCMT(uint64_t lpn, bool isWrite, uint64_t &tick, bool isGC,
+                       bool allocate) {
+  if (cmtPolicy == CMT_POLICY_LFU) {
+    return accessCMT_LFU(lpn, isWrite, tick, isGC, allocate);
+  }
+
+  return accessCMT_LRU(lpn, isWrite, tick, isGC, allocate);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// CMT POLICY: LRU — evict the entry that was accessed least recently.
+//
+// cmtOrder holds every cached LPN with the most recently used at the front.
+// cmt maps LPN → {entry, iterator into cmtOrder}, so promoting on a hit is an
+// O(1) list splice and picking a victim is an O(1) read of cmtOrder.back().
+// ════════════════════════════════════════════════════════════════════════════
+std::vector<std::pair<uint32_t, uint32_t>> *
+PageMapping::accessCMT_LRU(uint64_t lpn, bool isWrite, uint64_t &tick,
+                           bool isGC, bool allocate) {
   auto it = cmt.find(lpn);
 
   // ────────────────────────────────────────────────
@@ -677,7 +837,7 @@ PageMapping::accessCMT(uint64_t lpn, bool isWrite, uint64_t &tick, bool isGC) {
       it->second.first.dirty = true;
     }
 
-    return it->second.first.mapping;
+    return &it->second.first.mapping;
   }
 
   // ────────────────────────────────────────────────
@@ -690,13 +850,22 @@ PageMapping::accessCMT(uint64_t lpn, bool isWrite, uint64_t &tick, bool isGC) {
     stat.cmtMisses++;
   }
 
+  auto gmtIt = table.find(lpn);
+
+  // Lookup-only caller (read/trim) and the LPN was never written.  There is
+  // nothing to cache, so do not manufacture a mapping: doing so would grow the
+  // GMT without bound and fill the CMT with entries that can never hit.
+  if (gmtIt == table.end() && !allocate) {
+    return nullptr;
+  }
+
   // Edge Case 1: CMT is full — evict the LRU entry (back of list)
   if (cmt.size() >= cmtCapacity) {
     uint64_t evictLpn = cmtOrder.back();
 
-    // Bug fix: find the map entry BEFORE popping the list so that if the
-    // list and map ever de-sync we do not silently lose a pop without
-    // counting the eviction (and without writing back a dirty entry).
+    // Find the map entry BEFORE popping the list so that if the list and map
+    // ever de-sync we do not silently lose a pop without counting the
+    // eviction (and without writing back a dirty entry).
     auto evictIt = cmt.find(evictLpn);
     if (evictIt != cmt.end()) {
       cmtOrder.pop_back();  // only pop once we know the entry is valid
@@ -709,17 +878,18 @@ PageMapping::accessCMT(uint64_t lpn, bool isWrite, uint64_t &tick, bool isGC) {
         stat.cmtDirtyEvictions++;
         stat.cmtWritebacks++;
 
-        // V2 FIX: Dirty write-back requires a NAND flash program operation
+        // Dirty write-back requires a NAND flash program operation
         // (DFTL paper: writing a translation page back to flash)
         tick += cmtWriteBackLatency;
       }
 
       cmt.erase(evictIt);
+
+      // A dirty write-back can insert into `table` and rehash it, which
+      // invalidates every iterator including gmtIt.  Re-find before use.
+      gmtIt = table.find(lpn);
     }
   }
-
-  // Load from GMT (the existing full mapping table)
-  auto gmtIt = table.find(lpn);
 
   // Edge Case 3: Brand-new LPN — never written before, not in GMT either
   // This happens on the very first write to a logical page
@@ -738,8 +908,7 @@ PageMapping::accessCMT(uint64_t lpn, bool isWrite, uint64_t &tick, bool isGC) {
   }
   else {
     // Edge Case 4: Existing LPN fetched from GMT
-    // V2 FIX: DFTL "double read" — reading translation page from NAND flash
-    // This replaces the incorrect DRAM read that was 500x too cheap
+    // DFTL "double read" — reading the translation page from NAND flash
     tick += cmtMissLatency;
   }
 
@@ -749,7 +918,179 @@ PageMapping::accessCMT(uint64_t lpn, bool isWrite, uint64_t &tick, bool isGC) {
       lpn,
       std::make_pair(CMTEntry{gmtIt->second, isWrite}, cmtOrder.begin()));
 
-  return insertResult.first->second.first.mapping;
+  return &insertResult.first->second.first.mapping;
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// CMT POLICY: LFU — evict the entry with the fewest lifetime accesses.
+//
+// HOW LFU DIFFERS FROM LRU:
+//   LRU evicts the entry that was accessed LEAST RECENTLY.
+//   LFU evicts the entry that has been accessed the FEWEST TIMES overall.
+//
+// WHY LFU CAN BE BETTER:
+//   Hot pages (e.g. a frequently-read metadata page) stay in cache
+//   even if they weren't accessed in the last few operations.
+//   Under LRU, a sequential scan can flush the cache of hot pages.
+//   LFU is immune to this "cache pollution" from one-time accesses.
+//
+// WHY LFU CAN BE WORSE:
+//   Historically hot pages that are no longer needed stay in cache
+//   a long time because their count is high ("cache poisoning").
+//   LRU adapts to changing workload patterns faster.
+//
+// TIE-BREAKING: When two LPNs have the same frequency, evict the one
+//   that was accessed least recently (LRU-within-LFU). This is the
+//   standard approach and avoids arbitrary eviction ordering.
+//
+// COMPLEXITY: O(1) hit, O(1) eviction — same as LRU.
+//   (via the frequency-bucket algorithm by Shah, Mitra, Matani 2010)
+//
+// Select this policy with `CMTPolicy = 1` in the FTL config section.
+// ════════════════════════════════════════════════════════════════════════════
+std::vector<std::pair<uint32_t, uint32_t>> *
+PageMapping::accessCMT_LFU(uint64_t lpn, bool isWrite, uint64_t &tick,
+                           bool isGC, bool allocate) {
+  auto it = cmtLFU.find(lpn);
+
+  // ──────────────────────────────────────────────────────────
+  // CACHE HIT — LPN is in the LFU store
+  // ──────────────────────────────────────────────────────────
+  if (it != cmtLFU.end()) {
+    // Count the hit (same as LRU version)
+    if (isGC) { stat.cmtGCHits++; } else { stat.cmtHits++; }
+
+    CMTEntryLFU &entry = it->second;
+
+    // ── Promote: move LPN from bucket[f] → bucket[f+1] ──────
+    //
+    // Step 1: Remove from old bucket
+    uint64_t oldFreq = entry.freq;
+    cmtFreqBuckets[oldFreq].erase(entry.listIt);
+    //   If the old bucket is now empty AND it was the minimum,
+    //   the minimum must rise by 1 (the only LPN at min moved up).
+    if (cmtFreqBuckets[oldFreq].empty()) {
+      cmtFreqBuckets.erase(oldFreq);   // clean up empty bucket
+      if (cmtMinFreq == oldFreq) {
+        cmtMinFreq = oldFreq + 1;      // min can only go up by 1 on a hit
+      }
+    }
+
+    // Step 2: Insert into new bucket at the FRONT (= most recently used)
+    //   so that within the same frequency, tie-breaking is by recency.
+    uint64_t newFreq = oldFreq + 1;
+    entry.freq = newFreq;
+    cmtFreqBuckets[newFreq].push_front(lpn);
+    entry.listIt = cmtFreqBuckets[newFreq].begin();
+    // ────────────────────────────────────────────────────────
+
+    // Mark dirty on write (same as LRU)
+    if (isWrite) { entry.dirty = true; }
+
+    return &entry.mapping;
+  }
+
+  // ──────────────────────────────────────────────────────────
+  // CACHE MISS — LPN is not in the LFU store
+  // ──────────────────────────────────────────────────────────
+  if (isGC) { stat.cmtGCMisses++; } else { stat.cmtMisses++; }
+
+  auto gmtIt = table.find(lpn);
+
+  // Lookup-only caller (read/trim) and the LPN was never written — nothing to
+  // cache.  See the LRU version for why manufacturing a mapping here is wrong.
+  if (gmtIt == table.end() && !allocate) {
+    return nullptr;
+  }
+
+  // ── Eviction: remove the least-frequently-used entry ─────
+  //   The eviction candidate is always at:
+  //     cmtFreqBuckets[cmtMinFreq].back()
+  //   because:
+  //     - cmtMinFreq tracks the globally smallest occupied bucket.
+  //     - .back() is the LRU entry within that bucket (tie-break).
+  //
+  if (cmtLFU.size() >= cmtCapacity) {
+    // Look the bucket up rather than using operator[], which would
+    // default-construct an empty bucket and make .back() undefined if
+    // cmtMinFreq were ever stale.  If it is stale (e.g. after cmtErase),
+    // repair and retry once — never skip eviction while the cache is full.
+    auto minBucket = cmtFreqBuckets.find(cmtMinFreq);
+
+    if (minBucket == cmtFreqBuckets.end() || minBucket->second.empty()) {
+      repairLFUMinFreq();
+      minBucket = cmtFreqBuckets.find(cmtMinFreq);
+    }
+
+    if (minBucket == cmtFreqBuckets.end() || minBucket->second.empty()) {
+      panic("CMT-LFU: cache full but no eviction candidate");
+    }
+
+    uint64_t evictLpn = minBucket->second.back();  // LRU within min bucket
+    minBucket->second.pop_back();
+
+    if (minBucket->second.empty()) {
+      cmtFreqBuckets.erase(minBucket);   // clean up empty bucket
+      // Insertion below always creates an entry at frequency 1 and resets
+      // cmtMinFreq to 1, so no repair is required on this path.
+    }
+
+    stat.cmtEvictions++;
+
+    // Write-back if dirty (identical logic to LRU version)
+    auto evictIt = cmtLFU.find(evictLpn);
+    if (evictIt != cmtLFU.end()) {
+      if (evictIt->second.dirty) {
+        table[evictLpn] = evictIt->second.mapping;
+        stat.cmtDirtyEvictions++;
+        stat.cmtWritebacks++;
+        tick += cmtWriteBackLatency;
+      }
+      cmtLFU.erase(evictIt);
+    }
+    else {
+      panic("CMT-LFU: frequency bucket and map are out of sync");
+    }
+
+    // A dirty write-back can insert into `table` and rehash it, which
+    // invalidates every iterator including gmtIt.  Re-find before use.
+    gmtIt = table.find(lpn);
+  }
+  // ─────────────────────────────────────────────────────────
+
+  // Load from GMT (identical to LRU version)
+  if (gmtIt == table.end()) {
+    // Brand-new LPN — first write ever, not in GMT
+    auto ret = table.emplace(
+        lpn,
+        std::vector<std::pair<uint32_t, uint32_t>>(
+            bitsetSize, {param.totalPhysicalBlocks, param.pagesInBlock}));
+    if (!ret.second) { panic("CMT-LFU: Failed to create GMT entry"); }
+    gmtIt = ret.first;
+    // No flash read penalty — nothing to load
+  } else {
+    // Existing LPN — pay the NAND translation-page read cost
+    tick += cmtMissLatency;
+  }
+
+  // ── Insertion: new entry always starts at frequency = 1 ──
+  //   This is the crucial property of LFU insertion:
+  //   a brand-new entry starts at the minimum possible frequency,
+  //   so cmtMinFreq is always reset to 1 on every miss.
+  //   (It can't be lower than 1, and the new entry IS at 1.)
+  cmtMinFreq = 1;
+  cmtFreqBuckets[1].push_front(lpn);
+
+  CMTEntryLFU newEntry;
+  newEntry.mapping = gmtIt->second;
+  newEntry.dirty   = isWrite;
+  newEntry.freq    = 1;
+  newEntry.listIt  = cmtFreqBuckets[1].begin();
+
+  auto insertResult = cmtLFU.emplace(lpn, std::move(newEntry));
+  // ────────────────────────────────────────────────────────────
+
+  return &insertResult.first->second.mapping;
 }
 
 void PageMapping::readInternal(Request &req, uint64_t &tick) {
@@ -758,28 +1099,31 @@ void PageMapping::readInternal(Request &req, uint64_t &tick) {
   uint64_t finishedAt = tick;
 
   // ── CMT lookup (replaces direct table.find) ──────────────
-  auto &mappingData = accessCMT(req.lpn, false, tick);
+  // allocate=false: a read of a never-written LPN must not create a mapping.
+  auto *mappingData = accessCMT(req.lpn, false, tick, false, false);
 
   // Check if there is actually a valid mapping (non-empty)
   bool hasValidMapping = false;
-  for (uint32_t idx = 0; idx < bitsetSize; idx++) {
-    if (mappingData.at(idx).first < param.totalPhysicalBlocks) {
-      hasValidMapping = true;
-      break;
+  if (mappingData != nullptr) {
+    for (uint32_t idx = 0; idx < bitsetSize; idx++) {
+      if (mappingData->at(idx).first < param.totalPhysicalBlocks) {
+        hasValidMapping = true;
+        break;
+      }
     }
   }
 
   if (hasValidMapping) {
     if (bRandomTweak) {
-      pDRAM->read(&mappingData, 8 * req.ioFlag.count(), tick);
+      pDRAM->read(mappingData, 8 * req.ioFlag.count(), tick);
     }
     else {
-      pDRAM->read(&mappingData, 8, tick);
+      pDRAM->read(mappingData, 8, tick);
     }
 
     for (uint32_t idx = 0; idx < bitsetSize; idx++) {
       if (req.ioFlag.test(idx) || !bRandomTweak) {
-        auto &mapping = mappingData.at(idx);
+        auto &mapping = mappingData->at(idx);
 
         if (mapping.first < param.totalPhysicalBlocks &&
             mapping.second < param.pagesInBlock) {
@@ -823,7 +1167,8 @@ void PageMapping::writeInternal(Request &req, uint64_t &tick, bool sendToPAL) {
   bool readBeforeWrite = false;
 
   // ── CMT lookup — isWrite=true marks entry dirty immediately ──
-  auto &mappingData = accessCMT(req.lpn, true, tick);
+  // A write does create a mapping, so allocate=true (the default).
+  auto &mappingData = *accessCMT(req.lpn, true, tick);
 
   // Check if a previous mapping already exists
   bool hadPreviousMapping = false;
@@ -954,21 +1299,41 @@ void PageMapping::writeInternal(Request &req, uint64_t &tick, bool sendToPAL) {
 }
 
 void PageMapping::trimInternal(Request &req, uint64_t &tick) {
-  // For trim, use accessCMT to ensure consistent cache state
-  auto &mappingData = accessCMT(req.lpn, false, tick);
-  bool hasMappingData = mappingData.at(0).first < param.totalPhysicalBlocks;
+  // Peek only — do not call accessCMT.  A miss would load the doomed LPN
+  // into the cache (and possibly dirty-evict a useful victim) just so we
+  // can erase it on the next line.
+  auto *mappingData = getLiveMapping(req.lpn);
+
+  // Scan every sub-page, not just index 0: with random I/O tweak enabled a
+  // superpage can be partially mapped, so index 0 alone does not decide it.
+  bool hasMappingData = false;
+  if (mappingData != nullptr) {
+    for (uint32_t idx = 0; idx < bitsetSize; idx++) {
+      if (mappingData->at(idx).first < param.totalPhysicalBlocks) {
+        hasMappingData = true;
+        break;
+      }
+    }
+  }
 
   if (hasMappingData) {
     if (bRandomTweak) {
-      pDRAM->read(&mappingData, 8 * req.ioFlag.count(), tick);
+      pDRAM->read(mappingData, 8 * req.ioFlag.count(), tick);
     }
     else {
-      pDRAM->read(&mappingData, 8, tick);
+      pDRAM->read(mappingData, 8, tick);
     }
 
     // Do trim
     for (uint32_t idx = 0; idx < bitsetSize; idx++) {
-      auto &mapping = mappingData.at(idx);
+      auto &mapping = mappingData->at(idx);
+
+      // Skip sub-pages that were never mapped — invalidating them would look
+      // up a block index of totalPhysicalBlocks and panic.
+      if (mapping.first >= param.totalPhysicalBlocks) {
+        continue;
+      }
+
       auto block = blocks.find(mapping.first);
 
       if (block == blocks.end()) {
@@ -979,11 +1344,7 @@ void PageMapping::trimInternal(Request &req, uint64_t &tick) {
     }
 
     // Remove from CMT — this LPN is now invalid
-    auto cmtIt = cmt.find(req.lpn);
-    if (cmtIt != cmt.end()) {
-      cmtOrder.erase(cmtIt->second.second);
-      cmt.erase(cmtIt);
-    }
+    cmtErase(req.lpn);
     // Remove from GMT
     table.erase(req.lpn);
 
@@ -1113,20 +1474,24 @@ void PageMapping::getStatList(std::vector<Stats> &list, std::string prefix) {
   temp.desc = "Wear-leveling factor";
   list.push_back(temp);
 
+  temp.name = prefix + "page_mapping.cmt.policy";
+  temp.desc = "Active CMT replacement policy (0 = LRU, 1 = LFU)";
+  list.push_back(temp);
+
   temp.name = prefix + "page_mapping.cmt.hits";
-  temp.desc = "User mapping cache hits (CMT)";
+  temp.desc = "User mapping cache hits (CMT, excludes warm-up)";
   list.push_back(temp);
 
   temp.name = prefix + "page_mapping.cmt.misses";
-  temp.desc = "User mapping cache misses (CMT)";
+  temp.desc = "User mapping cache misses (CMT, excludes warm-up)";
   list.push_back(temp);
 
   temp.name = prefix + "page_mapping.cmt.hit_rate";
-  temp.desc = "User mapping cache hit rate % (CMT, excludes GC)";
+  temp.desc = "User mapping cache hit rate % (CMT, excludes GC and warm-up)";
   list.push_back(temp);
 
   temp.name = prefix + "page_mapping.cmt.evictions";
-  temp.desc = "Total CMT evictions";
+  temp.desc = "Total CMT evictions (excludes warm-up)";
   list.push_back(temp);
 
   temp.name = prefix + "page_mapping.cmt.dirty_evictions";
@@ -1149,6 +1514,14 @@ void PageMapping::getStatList(std::vector<Stats> &list, std::string prefix) {
   temp.desc = "CMT capacity (max entries in cache)";
   list.push_back(temp);
 
+  temp.name = prefix + "page_mapping.cmt.entry_bytes";
+  temp.desc = "Mapping bytes held per CMT entry (8 B per sub-page mapping)";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.cmt.capacity_bytes";
+  temp.desc = "Effective CMT size in bytes (capacity * entry_bytes)";
+  list.push_back(temp);
+
   temp.name = prefix + "page_mapping.cmt.occupancy";
   temp.desc = "CMT occupancy at end of simulation (entries used)";
   list.push_back(temp);
@@ -1167,6 +1540,7 @@ void PageMapping::getStatValues(std::vector<double> &values) {
       ? (double)stat.cmtHits / (double)totalLookups * 100.0
       : 0.0;
 
+  values.push_back((double)cmtPolicy);
   values.push_back((double)stat.cmtHits);
   values.push_back((double)stat.cmtMisses);
   values.push_back(hitRate);
@@ -1176,7 +1550,9 @@ void PageMapping::getStatValues(std::vector<double> &values) {
   values.push_back((double)stat.cmtGCHits);
   values.push_back((double)stat.cmtGCMisses);
   values.push_back((double)cmtCapacity);
-  values.push_back((double)cmt.size());
+  values.push_back((double)cmtEntryBytes);
+  values.push_back((double)(cmtCapacity * cmtEntryBytes));
+  values.push_back((double)cmtSize());
 }
 
 void PageMapping::resetStatValues() {

@@ -41,6 +41,7 @@ typedef enum {
   FTL_GC_EVICT_POLICY,
   FTL_GC_D_CHOICE_PARAM,
   FTL_USE_RANDOM_IO_TWEAK,
+  FTL_CMT_POLICY,
   FTL_CMT_CAPACITY_RATIO,
   FTL_CMT_CAPACITY_BYTES,
   FTL_CMT_MISS_LATENCY,
@@ -73,6 +74,11 @@ typedef enum {
   POLICY_DCHOICE,
 } EVICT_POLICY;
 
+typedef enum {
+  CMT_POLICY_LRU,  // Evict the least recently used mapping entry
+  CMT_POLICY_LFU,  // Evict the least frequently used mapping entry
+} CMT_POLICY;
+
 class Config : public BaseConfig {
  private:
   MAPPING mapping;             //!< Default: PAGE_MAPPING
@@ -88,8 +94,9 @@ class Config : public BaseConfig {
   EVICT_POLICY evictPolicy;    //!< Default: POLICY_GREEDY
   uint64_t dChoiceParam;       //!< Default: 3
   bool randomIOTweak;          //!< Default: true
+  CMT_POLICY cmtPolicy;        //!< Default: CMT_POLICY_LRU
   float cmtCapacityRatio;      //!< Default: 0.01 (1%)
-  uint64_t cmtCapacityBytes;   //!< Default: 8388608 (8MB)
+  uint64_t cmtCapacityBytes;   //!< Default: 2097152 (2MB)
   uint64_t cmtMissLatency;     //!< Default: 40000000 (40us — NAND LSB read)
   uint64_t cmtWriteBackLatency;//!< Default: 500000000 (500us — NAND LSB program)
 

@@ -27,6 +27,7 @@
 
 #include "ftl/abstract_ftl.hh"
 #include "ftl/common/block.hh"
+#include "ftl/config.hh"
 #include "ftl/ftl.hh"
 #include "pal/pal.hh"
 
@@ -54,17 +55,29 @@ class PageMapping : public AbstractFTL {
   uint32_t bitsetSize;
 
   // ── CMT (Cached Mapping Table) ─────────────────────────────
-  // Implements a size-limited LRU cache on top of the GMT (table).
-  // Simulates the SRAM mapping cache inside a real SSD controller.
+  // A size-limited cache of mapping entries sitting on top of the GMT
+  // (`table`).  Models the SRAM mapping cache inside a real SSD controller,
+  // as described in the DFTL paper (Gupta et al., ASPLOS '09).
+  //
+  // Two replacement policies are compiled in and selected at run time by the
+  // `CMTPolicy` config key.  Only the structures belonging to the active
+  // policy are ever populated; every operation that touches the cache goes
+  // through accessCMT() / cmtErase() / cmtSize() so the two policies can
+  // never fall out of sync.
 
+  CMT_POLICY cmtPolicy;  // which replacement policy is active
+
+  uint64_t cmtCapacity;  // max entries in cache — set in constructor
+  uint64_t cmtEntryBytes;        // bytes of mapping data held per CMT entry
+  uint64_t cmtMissLatency;       // NAND read latency on CMT miss (ps)
+  uint64_t cmtWriteBackLatency;  // NAND program latency on dirty eviction (ps)
+
+  // ── LRU policy state ───────────────────────────────────────
+  // Evicts the entry that was accessed least recently.
   struct CMTEntry {
     std::vector<std::pair<uint32_t, uint32_t>> mapping;  // physical (block, page)
     bool dirty;  // true if modified while in cache (needs write-back on eviction)
   };
-
-  uint64_t cmtCapacity;  // max entries in cache — set in constructor
-  uint64_t cmtMissLatency;       // NAND read latency on CMT miss (ps)
-  uint64_t cmtWriteBackLatency;  // NAND program latency on dirty eviction (ps)
 
   // LRU ordering: front = most recently used, back = least recently used
   std::list<uint64_t> cmtOrder;
@@ -73,15 +86,75 @@ class PageMapping : public AbstractFTL {
   std::unordered_map<uint64_t,
     std::pair<CMTEntry, std::list<uint64_t>::iterator>> cmt;
 
-  // CMT access function — call instead of table.find() for all reads/writes
-  std::vector<std::pair<uint32_t, uint32_t>> &accessCMT(uint64_t lpn,
-                                                          bool isWrite,
-                                                          uint64_t &tick,
-                                                          bool isGC = false);
+  // ── LFU policy state ───────────────────────────────────────
+  // Evicts the entry with the fewest lifetime accesses, breaking ties by
+  // recency.  O(1) frequency-bucket algorithm (Shah, Mitra, Matani 2010):
+  //   cmtFreqBuckets[f] = LPNs at frequency f, MRU at front.
+  //   cmtMinFreq        = smallest occupied frequency = eviction bucket.
+  // On HIT:  move LPN from bucket[f] → bucket[f+1].
+  // On MISS: evict bucket[cmtMinFreq].back(), insert new entry at freq 1.
+  struct CMTEntryLFU {
+    std::vector<std::pair<uint32_t, uint32_t>> mapping;
+    bool     dirty;    // needs write-back on eviction if true
+    uint64_t freq;     // lifetime hit count — never resets while in cache
+    std::list<uint64_t>::iterator listIt;  // O(1) removal from freq bucket
+  };
+
+  // frequency → list of LPNs at that freq (front=MRU for tie-break)
+  std::unordered_map<uint64_t, std::list<uint64_t>> cmtFreqBuckets;
+
+  // main LFU store: LPN → CMTEntryLFU
+  std::unordered_map<uint64_t, CMTEntryLFU> cmtLFU;
+
+  // always points at the eviction-candidate bucket
+  uint64_t cmtMinFreq;
+
+  // ── CMT operations ─────────────────────────────────────────
+  // Call accessCMT() instead of table.find() for all reads/writes.  When
+  // `allocate` is false a true miss returns nullptr instead of creating a
+  // mapping, so read/trim of a never-written LPN does not pollute the cache.
+  std::vector<std::pair<uint32_t, uint32_t>> *accessCMT(uint64_t lpn,
+                                                        bool isWrite,
+                                                        uint64_t &tick,
+                                                        bool isGC = false,
+                                                        bool allocate = true);
+
+  std::vector<std::pair<uint32_t, uint32_t>> *accessCMT_LRU(uint64_t lpn,
+                                                            bool isWrite,
+                                                            uint64_t &tick,
+                                                            bool isGC,
+                                                            bool allocate);
+
+  std::vector<std::pair<uint32_t, uint32_t>> *accessCMT_LFU(uint64_t lpn,
+                                                            bool isWrite,
+                                                            uint64_t &tick,
+                                                            bool isGC,
+                                                            bool allocate);
+
+  // Drop one LPN from whichever cache is active (no write-back — callers use
+  // this when the mapping is being destroyed, e.g. trim and format).
+  void cmtErase(uint64_t lpn);
+
+  // After an LFU bucket is removed, point cmtMinFreq at the smallest
+  // remaining frequency (or 0 if the cache is empty).
+  void repairLFUMinFreq();
+
+  // Mapping currently in force for an LPN: the CMT copy if resident (may be
+  // dirty and ahead of GMT), otherwise the GMT entry.  No cache mutation,
+  // no stats, no latency — for destroy paths (trim/format) that must not
+  // load a doomed LPN into the cache.
+  std::vector<std::pair<uint32_t, uint32_t>> *getLiveMapping(uint64_t lpn);
+
+  // Number of entries currently resident in the active cache.
+  uint64_t cmtSize() const;
 
   // Flush all dirty CMT entries back to GMT and clear the cache.
   // Called at destruction to keep GMT coherent after simulation.
   void flushCMT();
+
+  // Zero only the CMT counters.  Called once warm-up finishes so the reported
+  // hit rate describes the measured workload rather than the prefill.
+  void resetCMTStats();
 
   struct {
     uint64_t gcCount;

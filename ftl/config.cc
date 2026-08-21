@@ -38,6 +38,7 @@ const char NAME_GC_RECLAIM_THRESHOLD[] = "GCReclaimThreshold";
 const char NAME_GC_EVICT_POLICY[] = "EvictPolicy";
 const char NAME_GC_D_CHOICE_PARAM[] = "DChoiceParam";
 const char NAME_USE_RANDOM_IO_TWEAK[] = "EnableRandomIOTweak";
+const char NAME_CMT_POLICY[] = "CMTPolicy";
 const char NAME_CMT_CAPACITY_RATIO[] = "CMTCapacityRatio";
 const char NAME_CMT_CAPACITY_BYTES[] = "CMTCapacityBytes";
 const char NAME_CMT_MISS_LATENCY[] = "CMTMissLatency";
@@ -57,8 +58,9 @@ Config::Config() {
   evictPolicy = POLICY_GREEDY;
   dChoiceParam = 3;
   randomIOTweak = true;
+  cmtPolicy = CMT_POLICY_LRU;
   cmtCapacityRatio = 0.01f;
-  cmtCapacityBytes = 2097152;   // 2MB → matches sample.cfg (262,144 entries, covers 1GB)
+  cmtCapacityBytes = 2097152;   // 2MB → matches sample.cfg
   cmtMissLatency = 40000000;      // 40us — matches LSBRead for MLC NAND
   cmtWriteBackLatency = 500000000; // 500us — matches LSBWrite for MLC NAND
 }
@@ -105,6 +107,9 @@ bool Config::setConfig(const char *name, const char *value) {
   else if (MATCH_NAME(NAME_USE_RANDOM_IO_TWEAK)) {
     randomIOTweak = convertBool(value);
   }
+  else if (MATCH_NAME(NAME_CMT_POLICY)) {
+    cmtPolicy = (CMT_POLICY)strtoul(value, nullptr, 10);
+  }
   else if (MATCH_NAME(NAME_CMT_CAPACITY_RATIO)) {
     cmtCapacityRatio = strtof(value, nullptr);
   }
@@ -140,6 +145,14 @@ void Config::update() {
   if (invalidRatio < 0.f || invalidRatio > 1.f) {
     panic("Invalid InvalidPageRatio");
   }
+
+  if (cmtPolicy != CMT_POLICY_LRU && cmtPolicy != CMT_POLICY_LFU) {
+    panic("Invalid CMTPolicy");
+  }
+
+  if (cmtCapacityRatio < 0.f || cmtCapacityRatio > 1.f) {
+    panic("Invalid CMTCapacityRatio");
+  }
 }
 
 int64_t Config::readInt(uint32_t idx) {
@@ -154,6 +167,9 @@ int64_t Config::readInt(uint32_t idx) {
       break;
     case FTL_GC_EVICT_POLICY:
       ret = evictPolicy;
+      break;
+    case FTL_CMT_POLICY:
+      ret = cmtPolicy;
       break;
   }
 
