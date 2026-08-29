@@ -72,11 +72,15 @@ class PageMapping : public AbstractFTL {
   uint64_t cmtMissLatency;       // NAND read latency on CMT miss (ps)
   uint64_t cmtWriteBackLatency;  // NAND program latency on dirty eviction (ps)
 
+  bool cmtSpatialPrefetch;
+  uint64_t cmtPrefetchWindow;
+
   // ── LRU policy state ───────────────────────────────────────
   // Evicts the entry that was accessed least recently.
   struct CMTEntry {
     std::vector<std::pair<uint32_t, uint32_t>> mapping;  // physical (block, page)
     bool dirty;  // true if modified while in cache (needs write-back on eviction)
+    bool prefetched;
   };
 
   // LRU ordering: front = most recently used, back = least recently used
@@ -98,6 +102,7 @@ class PageMapping : public AbstractFTL {
     bool     dirty;    // needs write-back on eviction if true
     uint64_t freq;     // lifetime hit count — never resets while in cache
     std::list<uint64_t>::iterator listIt;  // O(1) removal from freq bucket
+    bool     prefetched;
   };
 
   // frequency → list of LPNs at that freq (front=MRU for tie-break)
@@ -130,6 +135,9 @@ class PageMapping : public AbstractFTL {
                                                             uint64_t &tick,
                                                             bool isGC,
                                                             bool allocate);
+
+  void evictOneLRUVictim(uint64_t &tick);
+  void evictOneLFUVictim(uint64_t &tick);
 
   // Drop one LPN from whichever cache is active (no write-back — callers use
   // this when the mapping is being destroyed, e.g. trim and format).
@@ -169,6 +177,10 @@ class PageMapping : public AbstractFTL {
     uint64_t cmtWritebacks;     // total write-back operations to GMT
     uint64_t cmtGCHits;         // GC-triggered lookups served from CMT
     uint64_t cmtGCMisses;       // GC-triggered lookups that required GMT read
+    uint64_t cmtPrefetchInsertions; // speculative entries inserted
+    uint64_t cmtPrefetchHits;       // prefetched entries later confirmed useful
+    uint64_t cmtPrefetchEvictedUnused; // prefetched entries evicted having never been hit
+    uint64_t cmtPrefetchTriggers;   // Number of times a demand miss initiated a prefetch window
   } stat;
 
   float freeBlockRatio();

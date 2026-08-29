@@ -83,6 +83,9 @@ PageMapping::PageMapping(ConfigReader &c, Parameter &p, PAL::PAL *l,
 
   // DFTL "double read" penalty: NAND flash read latency on CMT miss
   cmtMissLatency = conf.readUint(CONFIG_FTL, FTL_CMT_MISS_LATENCY);
+
+  cmtSpatialPrefetch = conf.readBoolean(CONFIG_FTL, FTL_CMT_SPATIAL_PREFETCH);
+  cmtPrefetchWindow = conf.readUint(CONFIG_FTL, FTL_CMT_PREFETCH_WINDOW);
   // NAND flash program latency for dirty write-back on eviction
   cmtWriteBackLatency = conf.readUint(CONFIG_FTL, FTL_CMT_WRITEBACK_LATENCY);
   cmtMinFreq = 0;
@@ -218,6 +221,19 @@ void PageMapping::resetCMTStats() {
   stat.cmtWritebacks = 0;
   stat.cmtGCHits = 0;
   stat.cmtGCMisses = 0;
+  stat.cmtPrefetchInsertions = 0;
+  stat.cmtPrefetchHits = 0;
+  stat.cmtPrefetchEvictedUnused = 0;
+  stat.cmtPrefetchTriggers = 0;
+
+  // Clear prefetched flag on all resident entries so warmup prefetches
+  // don't leak into measurement stats (which would cause accuracy > 100%).
+  for (auto &e : cmt) {
+    e.second.first.prefetched = false;
+  }
+  for (auto &e : cmtLFU) {
+    e.second.prefetched = false;
+  }
 }
 
 bool PageMapping::initialize() {
@@ -813,6 +829,27 @@ PageMapping::accessCMT(uint64_t lpn, bool isWrite, uint64_t &tick, bool isGC,
 // cmt maps LPN → {entry, iterator into cmtOrder}, so promoting on a hit is an
 // O(1) list splice and picking a victim is an O(1) read of cmtOrder.back().
 // ════════════════════════════════════════════════════════════════════════════
+void PageMapping::evictOneLRUVictim(uint64_t &tick) {
+  if (cmtOrder.empty()) return;
+  uint64_t evictLpn = cmtOrder.back();
+  auto evictIt = cmt.find(evictLpn);
+  if (evictIt != cmt.end()) {
+    if (evictIt->second.first.prefetched) {
+      stat.cmtPrefetchEvictedUnused++;
+    }
+    cmtOrder.pop_back();
+    stat.cmtEvictions++;
+
+    if (evictIt->second.first.dirty) {
+      table[evictLpn] = evictIt->second.first.mapping;
+      stat.cmtDirtyEvictions++;
+      stat.cmtWritebacks++;
+      tick += cmtWriteBackLatency;
+    }
+    cmt.erase(evictIt);
+  }
+}
+
 std::vector<std::pair<uint32_t, uint32_t>> *
 PageMapping::accessCMT_LRU(uint64_t lpn, bool isWrite, uint64_t &tick,
                            bool isGC, bool allocate) {
@@ -835,6 +872,11 @@ PageMapping::accessCMT_LRU(uint64_t lpn, bool isWrite, uint64_t &tick,
     // Mark dirty if this is a write — needs write-back on eviction
     if (isWrite) {
       it->second.first.dirty = true;
+    }
+
+    if (it->second.first.prefetched && !isGC) {
+      it->second.first.prefetched = false;
+      stat.cmtPrefetchHits++;
     }
 
     return &it->second.first.mapping;
@@ -861,36 +903,14 @@ PageMapping::accessCMT_LRU(uint64_t lpn, bool isWrite, uint64_t &tick,
 
   // Edge Case 1: CMT is full — evict the LRU entry (back of list)
   if (cmt.size() >= cmtCapacity) {
-    uint64_t evictLpn = cmtOrder.back();
+    evictOneLRUVictim(tick);
 
-    // Find the map entry BEFORE popping the list so that if the list and map
-    // ever de-sync we do not silently lose a pop without counting the
-    // eviction (and without writing back a dirty entry).
-    auto evictIt = cmt.find(evictLpn);
-    if (evictIt != cmt.end()) {
-      cmtOrder.pop_back();  // only pop once we know the entry is valid
-      stat.cmtEvictions++;
-
-      // Edge Case 2: Evicted entry is dirty — write back to GMT first
-      // Without this, the GMT has stale data and future misses load wrong mappings
-      if (evictIt->second.first.dirty) {
-        table[evictLpn] = evictIt->second.first.mapping;
-        stat.cmtDirtyEvictions++;
-        stat.cmtWritebacks++;
-
-        // Dirty write-back requires a NAND flash program operation
-        // (DFTL paper: writing a translation page back to flash)
-        tick += cmtWriteBackLatency;
-      }
-
-      cmt.erase(evictIt);
-
-      // A dirty write-back can insert into `table` and rehash it, which
-      // invalidates every iterator including gmtIt.  Re-find before use.
-      gmtIt = table.find(lpn);
-    }
+    // A dirty write-back can insert into `table` and rehash it, which
+    // invalidates every iterator including gmtIt.  Re-find before use.
+    gmtIt = table.find(lpn);
   }
 
+  bool paidMissLatency = false;
   // Edge Case 3: Brand-new LPN — never written before, not in GMT either
   // This happens on the very first write to a logical page
   if (gmtIt == table.end()) {
@@ -910,13 +930,90 @@ PageMapping::accessCMT_LRU(uint64_t lpn, bool isWrite, uint64_t &tick,
     // Edge Case 4: Existing LPN fetched from GMT
     // DFTL "double read" — reading the translation page from NAND flash
     tick += cmtMissLatency;
+    paidMissLatency = true;
   }
 
-  // Insert into CMT at front of LRU list (most recently used)
+  // ── Spatial prefetch (LRU version) ──────────────────────────────────────
+  //
+  // ORDER IS CRITICAL:
+  //   Phase 1: collect candidates
+  //   Phase 2: evict room for batch + 1 slot reserved for the demand entry
+  //   Phase 3: insert the demand entry (safe — Phase 2 cannot evict it)
+  //   Phase 4: fill prefetch batch at LRU end (lowest eviction priority)
+  //
+  // The demand entry is inserted AFTER Phase 2 so it can never be chosen
+  // as a victim by the batch-evict loop.  The "+1" in Phase 2's condition
+  // holds one slot in reserve for the demand entry itself.
+  // ────────────────────────────────────────────────────────────────────────
+
+  if (cmtSpatialPrefetch && !isGC && paidMissLatency) {
+    uint64_t groupStart = (lpn / cmtPrefetchWindow) * cmtPrefetchWindow;
+    uint64_t groupEnd = std::min(groupStart + cmtPrefetchWindow,
+                                 status.totalLogicalPages);
+    std::vector<uint64_t> candidates;
+
+    // Phase 1 — collect real, uncached candidates in the aligned window
+    for (uint64_t candidateLpn = groupStart; candidateLpn < groupEnd;
+         ++candidateLpn) {
+      if (candidateLpn == lpn) continue;
+      if (cmt.find(candidateLpn) != cmt.end()) continue;
+      if (table.find(candidateLpn) == table.end()) continue;
+      candidates.push_back(candidateLpn);
+    }
+
+    if (!candidates.empty()) {
+      stat.cmtPrefetchTriggers++;
+
+      // Clamp batch so it never exceeds cache capacity minus the demand slot.
+      // Without this, window > capacity would flush the entire CMT.
+      uint64_t maxBatch = cmtCapacity > 1 ? cmtCapacity - 1 : 0;
+      if (candidates.size() > maxBatch) {
+        candidates.resize(maxBatch);
+      }
+
+      // Phase 2 — evict room for the batch AND the demand slot.
+      // cmt already has one free slot from the pre-eviction above.
+      // Keep evicting while: free_slots < candidates.size() + 1
+      // i.e.  cmt.size() + candidates.size() + 1 > cmtCapacity
+      while (cmt.size() + candidates.size() + 1 > cmtCapacity &&
+             !cmt.empty()) {
+        evictOneLRUVictim(tick);
+      }
+
+      // A dirty eviction in Phase 2 can rehash `table`, invalidating gmtIt.
+      gmtIt = table.find(lpn);
+    }
+
+    // Phase 3 — insert the demand entry at MRU (front).
+    // Done AFTER Phase 2 so it cannot be a batch-eviction victim.
+    cmtOrder.push_front(lpn);
+    auto insertResult = cmt.emplace(
+        lpn,
+        std::make_pair(CMTEntry{gmtIt->second, isWrite, false},
+                       cmtOrder.begin()));
+
+    if (!candidates.empty()) {
+      // Phase 4 — insert prefetch batch at LRU end (lowest priority).
+      for (uint64_t candidateLpn : candidates) {
+        if (cmt.size() >= cmtCapacity) break;
+        auto candGmtIt = table.find(candidateLpn);
+        cmtOrder.push_back(candidateLpn);
+        cmt.emplace(candidateLpn,
+                    std::make_pair(CMTEntry{candGmtIt->second, false, true},
+                                   std::prev(cmtOrder.end())));
+        stat.cmtPrefetchInsertions++;
+      }
+    }
+
+    return &insertResult.first->second.first.mapping;
+  }
+
+  // Prefetch disabled (or GC path, or brand-new LPN): plain insert at MRU.
   cmtOrder.push_front(lpn);
   auto insertResult = cmt.emplace(
       lpn,
-      std::make_pair(CMTEntry{gmtIt->second, isWrite}, cmtOrder.begin()));
+      std::make_pair(CMTEntry{gmtIt->second, isWrite, false},
+                     cmtOrder.begin()));
 
   return &insertResult.first->second.first.mapping;
 }
@@ -948,6 +1045,42 @@ PageMapping::accessCMT_LRU(uint64_t lpn, bool isWrite, uint64_t &tick,
 //
 // Select this policy with `CMTPolicy = 1` in the FTL config section.
 // ════════════════════════════════════════════════════════════════════════════
+void PageMapping::evictOneLFUVictim(uint64_t &tick) {
+  auto minBucket = cmtFreqBuckets.find(cmtMinFreq);
+  if (minBucket == cmtFreqBuckets.end() || minBucket->second.empty()) {
+    repairLFUMinFreq();
+    minBucket = cmtFreqBuckets.find(cmtMinFreq);
+  }
+  if (minBucket == cmtFreqBuckets.end() || minBucket->second.empty()) {
+    panic("CMT-LFU: cache full but no eviction candidate");
+  }
+
+  uint64_t evictLpn = minBucket->second.back();
+  minBucket->second.pop_back();
+
+  if (minBucket->second.empty()) {
+    cmtFreqBuckets.erase(minBucket);
+  }
+
+  stat.cmtEvictions++;
+
+  auto evictIt = cmtLFU.find(evictLpn);
+  if (evictIt != cmtLFU.end()) {
+    if (evictIt->second.prefetched) {
+      stat.cmtPrefetchEvictedUnused++;
+    }
+    if (evictIt->second.dirty) {
+      table[evictLpn] = evictIt->second.mapping;
+      stat.cmtDirtyEvictions++;
+      stat.cmtWritebacks++;
+      tick += cmtWriteBackLatency;
+    }
+    cmtLFU.erase(evictIt);
+  } else {
+    panic("CMT-LFU: frequency bucket and map are out of sync");
+  }
+}
+
 std::vector<std::pair<uint32_t, uint32_t>> *
 PageMapping::accessCMT_LFU(uint64_t lpn, bool isWrite, uint64_t &tick,
                            bool isGC, bool allocate) {
@@ -987,6 +1120,11 @@ PageMapping::accessCMT_LFU(uint64_t lpn, bool isWrite, uint64_t &tick,
     // Mark dirty on write (same as LRU)
     if (isWrite) { entry.dirty = true; }
 
+    if (entry.prefetched && !isGC) {
+      entry.prefetched = false;
+      stat.cmtPrefetchHits++;
+    }
+
     return &entry.mapping;
   }
 
@@ -1011,46 +1149,7 @@ PageMapping::accessCMT_LFU(uint64_t lpn, bool isWrite, uint64_t &tick,
   //     - .back() is the LRU entry within that bucket (tie-break).
   //
   if (cmtLFU.size() >= cmtCapacity) {
-    // Look the bucket up rather than using operator[], which would
-    // default-construct an empty bucket and make .back() undefined if
-    // cmtMinFreq were ever stale.  If it is stale (e.g. after cmtErase),
-    // repair and retry once — never skip eviction while the cache is full.
-    auto minBucket = cmtFreqBuckets.find(cmtMinFreq);
-
-    if (minBucket == cmtFreqBuckets.end() || minBucket->second.empty()) {
-      repairLFUMinFreq();
-      minBucket = cmtFreqBuckets.find(cmtMinFreq);
-    }
-
-    if (minBucket == cmtFreqBuckets.end() || minBucket->second.empty()) {
-      panic("CMT-LFU: cache full but no eviction candidate");
-    }
-
-    uint64_t evictLpn = minBucket->second.back();  // LRU within min bucket
-    minBucket->second.pop_back();
-
-    if (minBucket->second.empty()) {
-      cmtFreqBuckets.erase(minBucket);   // clean up empty bucket
-      // Insertion below always creates an entry at frequency 1 and resets
-      // cmtMinFreq to 1, so no repair is required on this path.
-    }
-
-    stat.cmtEvictions++;
-
-    // Write-back if dirty (identical logic to LRU version)
-    auto evictIt = cmtLFU.find(evictLpn);
-    if (evictIt != cmtLFU.end()) {
-      if (evictIt->second.dirty) {
-        table[evictLpn] = evictIt->second.mapping;
-        stat.cmtDirtyEvictions++;
-        stat.cmtWritebacks++;
-        tick += cmtWriteBackLatency;
-      }
-      cmtLFU.erase(evictIt);
-    }
-    else {
-      panic("CMT-LFU: frequency bucket and map are out of sync");
-    }
+    evictOneLFUVictim(tick);
 
     // A dirty write-back can insert into `table` and rehash it, which
     // invalidates every iterator including gmtIt.  Re-find before use.
@@ -1059,6 +1158,7 @@ PageMapping::accessCMT_LFU(uint64_t lpn, bool isWrite, uint64_t &tick,
   // ─────────────────────────────────────────────────────────
 
   // Load from GMT (identical to LRU version)
+  bool paidMissLatency = false;
   if (gmtIt == table.end()) {
     // Brand-new LPN — first write ever, not in GMT
     auto ret = table.emplace(
@@ -1071,24 +1171,112 @@ PageMapping::accessCMT_LFU(uint64_t lpn, bool isWrite, uint64_t &tick,
   } else {
     // Existing LPN — pay the NAND translation-page read cost
     tick += cmtMissLatency;
+    paidMissLatency = true;
   }
 
-  // ── Insertion: new entry always starts at frequency = 1 ──
-  //   This is the crucial property of LFU insertion:
-  //   a brand-new entry starts at the minimum possible frequency,
-  //   so cmtMinFreq is always reset to 1 on every miss.
-  //   (It can't be lower than 1, and the new entry IS at 1.)
+  // ── Spatial prefetch (LFU version) ──────────────────────────────────────
+  //
+  // ORDER IS CRITICAL — same guarantee as the LRU path:
+  //   Phase 1: collect candidates
+  //   Phase 2: evict room for batch + 1 slot reserved for the demand entry
+  //   Phase 3: insert the demand entry (after eviction — cannot be a victim)
+  //   Phase 4: fill prefetch batch at freq=1 (lowest eviction priority)
+  //
+  // The demand entry is inserted in Phase 3, AFTER Phase 2's eviction loop,
+  // so Phase 2 can never choose it as a victim.  The "+1" in Phase 2's
+  // condition holds exactly one slot in reserve for the demand entry.
+  // ────────────────────────────────────────────────────────────────────────
+
+  if (cmtSpatialPrefetch && !isGC && paidMissLatency) {
+    uint64_t groupStart = (lpn / cmtPrefetchWindow) * cmtPrefetchWindow;
+    uint64_t groupEnd = std::min(groupStart + cmtPrefetchWindow,
+                                 status.totalLogicalPages);
+    std::vector<uint64_t> candidates;
+
+    // Phase 1 — collect real, uncached candidates in the aligned window
+    for (uint64_t candidateLpn = groupStart; candidateLpn < groupEnd;
+         ++candidateLpn) {
+      if (candidateLpn == lpn) continue;
+      if (cmtLFU.find(candidateLpn) != cmtLFU.end()) continue;
+      if (table.find(candidateLpn) == table.end()) continue;
+      candidates.push_back(candidateLpn);
+    }
+
+    if (!candidates.empty()) {
+      stat.cmtPrefetchTriggers++;
+
+      // Clamp batch so it never exceeds cache capacity minus the demand slot.
+      // Without this, window > capacity would flush the entire CMT.
+      uint64_t maxBatch = cmtCapacity > 1 ? cmtCapacity - 1 : 0;
+      if (candidates.size() > maxBatch) {
+        candidates.resize(maxBatch);
+      }
+
+      // Phase 2 — evict room for the batch AND the demand slot.
+      // cmtLFU already has one free slot from the pre-eviction above.
+      // Keep evicting while: free_slots < candidates.size() + 1
+      // i.e.  cmtLFU.size() + candidates.size() + 1 > cmtCapacity
+      while (cmtLFU.size() + candidates.size() + 1 > cmtCapacity &&
+             !cmtLFU.empty()) {
+        evictOneLFUVictim(tick);
+
+        // A dirty write-back can rehash `table`; re-find gmtIt after eviction.
+        gmtIt = table.find(lpn);
+      }
+    }
+
+    // Phase 3 — insert demand entry (AFTER Phase 2 so it cannot be evicted).
+    // ── Insertion: new entry always starts at frequency = 1 ──────────────
+    cmtMinFreq = 1;
+    cmtFreqBuckets[1].push_front(lpn);
+
+    CMTEntryLFU newEntry;
+    newEntry.mapping    = gmtIt->second;
+    newEntry.dirty      = isWrite;
+    newEntry.freq       = 1;
+    newEntry.listIt     = cmtFreqBuckets[1].begin();
+    newEntry.prefetched = false;
+
+    auto insertResult = cmtLFU.emplace(lpn, std::move(newEntry));
+
+    if (!candidates.empty()) {
+      // Phase 4 — insert prefetch batch at freq=1 (lowest eviction priority).
+      for (uint64_t candidateLpn : candidates) {
+        if (cmtLFU.size() >= cmtCapacity) break;
+        auto candGmtIt = table.find(candidateLpn);
+
+        cmtMinFreq = 1;
+        cmtFreqBuckets[1].push_back(candidateLpn);
+
+        CMTEntryLFU candEntry;
+        candEntry.mapping    = candGmtIt->second;
+        candEntry.dirty      = false;
+        candEntry.freq       = 1;
+        candEntry.listIt     = std::prev(cmtFreqBuckets[1].end());
+        candEntry.prefetched = true;
+
+        cmtLFU.emplace(candidateLpn, std::move(candEntry));
+        stat.cmtPrefetchInsertions++;
+      }
+    }
+
+    return &insertResult.first->second.mapping;
+  }
+
+  // Prefetch disabled (or GC path, or brand-new LPN): plain insert at freq=1.
+  // ── Insertion: new entry always starts at frequency = 1 ──────────────────
   cmtMinFreq = 1;
   cmtFreqBuckets[1].push_front(lpn);
 
   CMTEntryLFU newEntry;
-  newEntry.mapping = gmtIt->second;
-  newEntry.dirty   = isWrite;
-  newEntry.freq    = 1;
-  newEntry.listIt  = cmtFreqBuckets[1].begin();
+  newEntry.mapping    = gmtIt->second;
+  newEntry.dirty      = isWrite;
+  newEntry.freq       = 1;
+  newEntry.listIt     = cmtFreqBuckets[1].begin();
+  newEntry.prefetched = false;
 
   auto insertResult = cmtLFU.emplace(lpn, std::move(newEntry));
-  // ────────────────────────────────────────────────────────────
+  // ──────────────────────────────────────────────────────────────────────────
 
   return &insertResult.first->second.mapping;
 }
@@ -1525,6 +1713,38 @@ void PageMapping::getStatList(std::vector<Stats> &list, std::string prefix) {
   temp.name = prefix + "page_mapping.cmt.occupancy";
   temp.desc = "CMT occupancy at end of simulation (entries used)";
   list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.cmt.prefetch_insertions";
+  temp.desc = "Speculative CMT entries inserted by spatial prefetch";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.cmt.prefetch_hits";
+  temp.desc = "Prefetched entries hit at least once before eviction";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.cmt.prefetch_evicted_unused";
+  temp.desc = "Prefetched entries evicted without ever being hit (wasted)";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.cmt.prefetch_triggers";
+  temp.desc = "Number of times a demand miss initiated a prefetch window";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.cmt.prefetch_accuracy_percent";
+  temp.desc = "Prefetch Accuracy (%)";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.cmt.prefetch_pollution_percent";
+  temp.desc = "Prefetch Pollution (%)";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.cmt.prefetch_coverage_percent";
+  temp.desc = "Prefetch Coverage (%)";
+  list.push_back(temp);
+
+  temp.name = prefix + "page_mapping.cmt.prefetch_avg_batch_size";
+  temp.desc = "Average valid LPNs fetched per prefetch window";
+  list.push_back(temp);
 }
 
 void PageMapping::getStatValues(std::vector<double> &values) {
@@ -1553,6 +1773,31 @@ void PageMapping::getStatValues(std::vector<double> &values) {
   values.push_back((double)cmtEntryBytes);
   values.push_back((double)(cmtCapacity * cmtEntryBytes));
   values.push_back((double)cmtSize());
+
+  double prefetchAccuracy = stat.cmtPrefetchInsertions > 0
+      ? (double)stat.cmtPrefetchHits / (double)stat.cmtPrefetchInsertions * 100.0
+      : 0.0;
+  
+  double prefetchPollution = stat.cmtEvictions > 0
+      ? (double)stat.cmtPrefetchEvictedUnused / (double)stat.cmtEvictions * 100.0
+      : 0.0;
+  
+  double prefetchCoverage = stat.cmtHits > 0
+      ? (double)stat.cmtPrefetchHits / (double)stat.cmtHits * 100.0
+      : 0.0;
+  
+  double prefetchAvgBatch = stat.cmtPrefetchTriggers > 0
+      ? (double)stat.cmtPrefetchInsertions / (double)stat.cmtPrefetchTriggers
+      : 0.0;
+
+  values.push_back((double)stat.cmtPrefetchInsertions);
+  values.push_back((double)stat.cmtPrefetchHits);
+  values.push_back((double)stat.cmtPrefetchEvictedUnused);
+  values.push_back((double)stat.cmtPrefetchTriggers);
+  values.push_back(prefetchAccuracy);
+  values.push_back(prefetchPollution);
+  values.push_back(prefetchCoverage);
+  values.push_back(prefetchAvgBatch);
 }
 
 void PageMapping::resetStatValues() {
