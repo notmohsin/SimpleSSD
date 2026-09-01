@@ -136,8 +136,21 @@ class PageMapping : public AbstractFTL {
                                                             bool isGC,
                                                             bool allocate);
 
-  void evictOneLRUVictim(uint64_t &tick);
-  void evictOneLFUVictim(uint64_t &tick);
+  void evictOneLRUVictim(uint64_t &tick, bool chargeWriteBack = true);
+  void evictOneLFUVictim(uint64_t &tick, bool chargeWriteBack = true);
+
+  // Spatial prefetch: one NAND translation-page read already paid
+  // CMTMissLatency; install neighboring GMT mappings into the CMT.
+  // A separate translation-page buffer (DFTL GTD/TP cache) is not modeled —
+  // mappings are installed directly into the CMT.
+  bool cmtContains(uint64_t lpn) const;
+  std::vector<uint64_t> collectPrefetchCandidates(uint64_t lpn) const;
+  void evictForPrefetchBatch(size_t batchSize, uint64_t &tick);
+  uint64_t insertPrefetchBatchLRU(const std::vector<uint64_t> &candidates);
+  uint64_t insertPrefetchBatchLFU(const std::vector<uint64_t> &candidates);
+  void chargePrefetchDRAM(uint64_t nEntries, uint64_t &tick);
+  std::vector<std::pair<uint32_t, uint32_t>> *cmtMappingOf(uint64_t lpn);
+  uint64_t countResidentPrefetched() const;
 
   // Drop one LPN from whichever cache is active (no write-back — callers use
   // this when the mapping is being destroyed, e.g. trim and format).
