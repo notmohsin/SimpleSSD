@@ -43,8 +43,8 @@ const char NAME_CMT_CAPACITY_RATIO[] = "CMTCapacityRatio";
 const char NAME_CMT_CAPACITY_BYTES[] = "CMTCapacityBytes";
 const char NAME_CMT_MISS_LATENCY[] = "CMTMissLatency";
 const char NAME_CMT_WRITEBACK_LATENCY[] = "CMTWriteBackLatency";
-const char NAME_CMT_SPATIAL_PREFETCH[] = "CMTSpatialPrefetch";
-const char NAME_CMT_PREFETCH_WINDOW[] = "CMTPrefetchWindow";
+const char NAME_CMT_WINDOW_FILL[] = "CMTWindowFill";
+const char NAME_CMT_WINDOW_SIZE[] = "CMTWindowSize";
 
 Config::Config() {
   mapping = PAGE_MAPPING;
@@ -65,8 +65,8 @@ Config::Config() {
   cmtCapacityBytes = 2097152;   // 2MB → matches sample.cfg
   cmtMissLatency = 40000000;      // 40us — matches LSBRead for MLC NAND
   cmtWriteBackLatency = 500000000; // 500us — matches LSBWrite for MLC NAND
-  cmtSpatialPrefetch = false;
-  cmtPrefetchWindow = 512;
+  cmtWindowFill = false;
+  cmtWindowSize = 512;
 }
 
 bool Config::setConfig(const char *name, const char *value) {
@@ -126,11 +126,11 @@ bool Config::setConfig(const char *name, const char *value) {
   else if (MATCH_NAME(NAME_CMT_WRITEBACK_LATENCY)) {
     cmtWriteBackLatency = strtoull(value, nullptr, 10);
   }
-  else if (MATCH_NAME(NAME_CMT_SPATIAL_PREFETCH)) {
-    cmtSpatialPrefetch = convertBool(value);
+  else if (MATCH_NAME(NAME_CMT_WINDOW_FILL)) {
+    cmtWindowFill = convertBool(value);
   }
-  else if (MATCH_NAME(NAME_CMT_PREFETCH_WINDOW)) {
-    cmtPrefetchWindow = strtoull(value, nullptr, 10);
+  else if (MATCH_NAME(NAME_CMT_WINDOW_SIZE)) {
+    cmtWindowSize = strtoull(value, nullptr, 10);
   }
   else {
     ret = false;
@@ -164,8 +164,8 @@ void Config::update() {
     panic("Invalid CMTCapacityRatio");
   }
 
-  if (cmtSpatialPrefetch && cmtPrefetchWindow == 0) {
-    panic("Invalid CMTPrefetchWindow");
+  if (cmtWindowFill && cmtWindowSize == 0) {
+    panic("Invalid CMTWindowSize");
   }
 }
 
@@ -215,8 +215,8 @@ uint64_t Config::readUint(uint32_t idx) {
     case FTL_CMT_WRITEBACK_LATENCY:
       ret = cmtWriteBackLatency;
       break;
-    case FTL_CMT_PREFETCH_WINDOW:
-      ret = cmtPrefetchWindow;
+    case FTL_CMT_WINDOW_SIZE:
+      ret = cmtWindowSize;
       break;
   }
 
@@ -257,8 +257,8 @@ bool Config::readBoolean(uint32_t idx) {
     case FTL_USE_RANDOM_IO_TWEAK:
       ret = randomIOTweak;
       break;
-    case FTL_CMT_SPATIAL_PREFETCH:
-      ret = cmtSpatialPrefetch;
+    case FTL_CMT_WINDOW_FILL:
+      ret = cmtWindowFill;
       break;
   }
 

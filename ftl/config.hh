@@ -46,8 +46,8 @@ typedef enum {
   FTL_CMT_CAPACITY_BYTES,
   FTL_CMT_MISS_LATENCY,
   FTL_CMT_WRITEBACK_LATENCY,
-  FTL_CMT_SPATIAL_PREFETCH,
-  FTL_CMT_PREFETCH_WINDOW,
+  FTL_CMT_WINDOW_FILL,
+  FTL_CMT_WINDOW_SIZE,
 
   /* N+K Mapping configuration*/
   FTL_NKMAP_N,
@@ -101,8 +101,8 @@ class Config : public BaseConfig {
   uint64_t cmtCapacityBytes;   //!< Default: 2097152 (2MB)
   uint64_t cmtMissLatency;     //!< Default: 40000000 (40us — NAND LSB read)
   uint64_t cmtWriteBackLatency;//!< Default: 500000000 (500us — NAND LSB program)
-  bool cmtSpatialPrefetch;     //!< Default: false
-  uint64_t cmtPrefetchWindow;  //!< Default: 512
+  bool cmtWindowFill;     //!< Default: false
+  uint64_t cmtWindowSize;  //!< Default: 512
 
  public:
   Config();

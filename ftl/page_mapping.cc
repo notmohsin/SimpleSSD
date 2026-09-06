@@ -86,8 +86,8 @@ PageMapping::PageMapping(ConfigReader &c, Parameter &p, PAL::PAL *l,
   // DFTL "double read" penalty: NAND flash read latency on CMT miss
   cmtMissLatency = conf.readUint(CONFIG_FTL, FTL_CMT_MISS_LATENCY);
 
-  cmtSpatialPrefetch = conf.readBoolean(CONFIG_FTL, FTL_CMT_SPATIAL_PREFETCH);
-  cmtPrefetchWindow = conf.readUint(CONFIG_FTL, FTL_CMT_PREFETCH_WINDOW);
+  cmtWindowFill = conf.readBoolean(CONFIG_FTL, FTL_CMT_WINDOW_FILL);
+  cmtWindowSize = conf.readUint(CONFIG_FTL, FTL_CMT_WINDOW_SIZE);
   // NAND flash program latency for dirty write-back on eviction
   cmtWriteBackLatency = conf.readUint(CONFIG_FTL, FTL_CMT_WRITEBACK_LATENCY);
   cmtMinFreq = 0;
@@ -99,18 +99,21 @@ PageMapping::PageMapping(ConfigReader &c, Parameter &p, PAL::PAL *l,
              cmtEntryBytes, bitsetSize, cmtCapacity * cmtEntryBytes);
   debugprint(LOG_FTL_PAGE_MAPPING,
              "CMT  | Prefetch %s | window %" PRIu64 " LPNs",
-             cmtSpatialPrefetch ? "on" : "off", cmtPrefetchWindow);
+             cmtWindowFill ? "on" : "off", cmtWindowSize);
 }
 
 PageMapping::~PageMapping() {
+  uint64_t residentFills = countResidentFills();
+  stat.cmtFillEvictedUnused += residentFills; // Ponytail: Fix Bug #1 - account for unresolved fills
+
   debugprint(LOG_FTL_PAGE_MAPPING,
-             "CMT  | Prefetch | triggers %" PRIu64 " | insertions %" PRIu64
+             "CMT  | WindowFill | triggers %" PRIu64 " | insertions %" PRIu64
              " | hits %" PRIu64 " | unused_evict %" PRIu64
-             " | resident_prefetched %" PRIu64 " | occupancy %" PRIu64
+             " | resident_fills %" PRIu64 " | occupancy %" PRIu64
              " / %" PRIu64,
-             stat.cmtPrefetchTriggers, stat.cmtPrefetchInsertions,
-             stat.cmtPrefetchHits, stat.cmtPrefetchEvictedUnused,
-             countResidentPrefetched(), cmtSize(), cmtCapacity);
+             stat.cmtFillTriggers, stat.cmtFillInsertions,
+             stat.cmtFillHits, stat.cmtFillEvictedUnused,
+             residentFills, cmtSize(), cmtCapacity);
 
   // Flush any remaining dirty CMT entries back to GMT so the mapping
   // table is coherent if inspected after simulation ends.
@@ -165,8 +168,8 @@ void PageMapping::cmtErase(uint64_t lpn) {
     auto iter = cmtLFU.find(lpn);
 
     if (iter != cmtLFU.end()) {
-      if (iter->second.prefetched) {
-        stat.cmtPrefetchEvictedUnused++;
+      if (iter->second.fillUnused) {
+        stat.cmtFillEvictedUnused++;
       }
       uint64_t freq = iter->second.freq;
       auto bucket = cmtFreqBuckets.find(freq);
@@ -192,8 +195,8 @@ void PageMapping::cmtErase(uint64_t lpn) {
     auto iter = cmt.find(lpn);
 
     if (iter != cmt.end()) {
-      if (iter->second.first.prefetched) {
-        stat.cmtPrefetchEvictedUnused++;
+      if (iter->second.first.fillUnused) {
+        stat.cmtFillEvictedUnused++;
       }
       cmtOrder.erase(iter->second.second);
       cmt.erase(iter);
@@ -241,18 +244,20 @@ void PageMapping::resetCMTStats() {
   stat.cmtWritebacks = 0;
   stat.cmtGCHits = 0;
   stat.cmtGCMisses = 0;
-  stat.cmtPrefetchInsertions = 0;
-  stat.cmtPrefetchHits = 0;
-  stat.cmtPrefetchEvictedUnused = 0;
-  stat.cmtPrefetchTriggers = 0;
+  stat.cmtFillInsertions = 0;
+  stat.cmtFillHits = 0;
+  stat.cmtFillEvictedUnused = 0;
+  stat.cmtFillTriggers = 0;
 
   // Clear prefetched flag on all resident entries so warmup prefetches
   // don't leak into measurement stats (which would cause accuracy > 100%).
   for (auto &e : cmt) {
-    e.second.first.prefetched = false;
+    e.second.first.fillOrigin = false;
+    e.second.first.fillUnused = false;
   }
   for (auto &e : cmtLFU) {
-    e.second.prefetched = false;
+    e.second.fillOrigin = false;
+    e.second.fillUnused = false;
   }
 }
 
@@ -847,16 +852,16 @@ bool PageMapping::cmtContains(uint64_t lpn) const {
                                      : cmt.count(lpn) != 0;
 }
 
-std::vector<uint64_t> PageMapping::collectPrefetchCandidates(
+std::vector<uint64_t> PageMapping::collectFillCandidates(
     uint64_t lpn) const {
   std::vector<uint64_t> candidates;
-  if (cmtPrefetchWindow == 0) {
+  if (cmtWindowSize == 0) {
     return candidates;
   }
 
-  uint64_t groupStart = (lpn / cmtPrefetchWindow) * cmtPrefetchWindow;
+  uint64_t groupStart = (lpn / cmtWindowSize) * cmtWindowSize;
   uint64_t groupEnd =
-      std::min(groupStart + cmtPrefetchWindow, status.totalLogicalPages);
+      std::min(groupStart + cmtWindowSize, status.totalLogicalPages);
 
   for (uint64_t candidateLpn = groupStart; candidateLpn < groupEnd;
        ++candidateLpn) {
@@ -874,7 +879,7 @@ std::vector<uint64_t> PageMapping::collectPrefetchCandidates(
   return candidates;
 }
 
-void PageMapping::evictForPrefetchBatch(size_t batchSize, uint64_t &tick) {
+void PageMapping::evictForFillBatch(size_t batchSize, uint64_t &tick) {
   // Prefetch-induced victims still write GMT so mappings stay coherent, but
   // charging CMTWriteBackLatency per entry would serialize hundreds of NAND
   // programs on one miss.  Charge at most one translation-page program if any
@@ -897,7 +902,7 @@ void PageMapping::evictForPrefetchBatch(size_t batchSize, uint64_t &tick) {
   }
 }
 
-uint64_t PageMapping::insertPrefetchBatchLRU(
+uint64_t PageMapping::insertFillBatchLRU(
     const std::vector<uint64_t> &candidates) {
   cmt.reserve(cmt.size() + candidates.size());
   uint64_t inserted = 0;
@@ -910,7 +915,7 @@ uint64_t PageMapping::insertPrefetchBatchLRU(
     cmtOrder.push_back(candidateLpn);
     auto result = cmt.emplace(
         candidateLpn,
-        std::make_pair(CMTEntry{candGmtIt->second, false, true},
+        std::make_pair(CMTEntry{candGmtIt->second, false, true, true},
                        std::prev(cmtOrder.end())));
     if (!result.second) {
       cmtOrder.pop_back();
@@ -919,11 +924,11 @@ uint64_t PageMapping::insertPrefetchBatchLRU(
     inserted++;
   }
 
-  stat.cmtPrefetchInsertions += inserted;
+  stat.cmtFillInsertions += inserted;
   return inserted;
 }
 
-uint64_t PageMapping::insertPrefetchBatchLFU(
+uint64_t PageMapping::insertFillBatchLFU(
     const std::vector<uint64_t> &candidates) {
   cmtLFU.reserve(cmtLFU.size() + candidates.size());
   uint64_t inserted = 0;
@@ -941,7 +946,8 @@ uint64_t PageMapping::insertPrefetchBatchLFU(
     candEntry.dirty = false;
     candEntry.freq = 1;
     candEntry.listIt = std::prev(cmtFreqBuckets[1].end());
-    candEntry.prefetched = true;
+    candEntry.fillOrigin = true;
+    candEntry.fillUnused = true;
 
     auto result = cmtLFU.emplace(candidateLpn, std::move(candEntry));
     if (!result.second) {
@@ -955,11 +961,11 @@ uint64_t PageMapping::insertPrefetchBatchLFU(
     inserted++;
   }
 
-  stat.cmtPrefetchInsertions += inserted;
+  stat.cmtFillInsertions += inserted;
   return inserted;
 }
 
-void PageMapping::chargePrefetchDRAM(uint64_t nEntries, uint64_t &tick) {
+void PageMapping::chargeWindowFillDRAM(uint64_t nEntries, uint64_t &tick) {
   if (nEntries == 0 || pDRAM == nullptr) {
     return;
   }
@@ -983,16 +989,16 @@ std::vector<std::pair<uint32_t, uint32_t>> *PageMapping::cmtMappingOf(
   return &it->second.first.mapping;
 }
 
-uint64_t PageMapping::countResidentPrefetched() const {
+uint64_t PageMapping::countResidentFills() const {
   uint64_t n = 0;
   if (cmtPolicy == CMT_POLICY_LFU) {
     for (const auto &e : cmtLFU) {
-      if (e.second.prefetched) n++;
+      if (e.second.fillUnused) n++;
     }
   }
   else {
     for (const auto &e : cmt) {
-      if (e.second.first.prefetched) n++;
+      if (e.second.first.fillUnused) n++;
     }
   }
   return n;
@@ -1010,8 +1016,8 @@ void PageMapping::evictOneLRUVictim(uint64_t &tick, bool chargeWriteBack) {
   uint64_t evictLpn = cmtOrder.back();
   auto evictIt = cmt.find(evictLpn);
   if (evictIt != cmt.end()) {
-    if (evictIt->second.first.prefetched) {
-      stat.cmtPrefetchEvictedUnused++;
+    if (evictIt->second.first.fillUnused) {
+      stat.cmtFillEvictedUnused++;
     }
     cmtOrder.pop_back();
     stat.cmtEvictions++;
@@ -1052,9 +1058,11 @@ PageMapping::accessCMT_LRU(uint64_t lpn, bool isWrite, uint64_t &tick,
       it->second.first.dirty = true;
     }
 
-    if (it->second.first.prefetched && !isGC) {
-      it->second.first.prefetched = false;
-      stat.cmtPrefetchHits++;
+    if (it->second.first.fillOrigin && !isGC) {
+      stat.cmtFillHits++;
+    }
+    if (it->second.first.fillUnused && !isGC) {
+      it->second.first.fillUnused = false;
     }
 
     return &it->second.first.mapping;
@@ -1111,7 +1119,7 @@ PageMapping::accessCMT_LRU(uint64_t lpn, bool isWrite, uint64_t &tick,
     paidMissLatency = true;
   }
 
-  // ── Spatial prefetch (LRU version) ──────────────────────────────────────
+  // ── Window fill (LRU version) ──────────────────────────────────────
   //
   // ORDER IS CRITICAL:
   //   Phase 1: collect candidates
@@ -1124,12 +1132,12 @@ PageMapping::accessCMT_LRU(uint64_t lpn, bool isWrite, uint64_t &tick,
   // holds one slot in reserve for the demand entry itself.
   // ────────────────────────────────────────────────────────────────────────
 
-  if (cmtSpatialPrefetch && !isGC && paidMissLatency) {
-    std::vector<uint64_t> candidates = collectPrefetchCandidates(lpn);
+  if (cmtWindowFill && !isGC && paidMissLatency) {
+    std::vector<uint64_t> candidates = collectFillCandidates(lpn);
 
     if (!candidates.empty()) {
-      stat.cmtPrefetchTriggers++;
-      evictForPrefetchBatch(candidates.size(), tick);
+      stat.cmtFillTriggers++;
+      evictForFillBatch(candidates.size(), tick);
       gmtIt = table.find(lpn);
       if (gmtIt == table.end()) {
         panic("CMT: demand LPN missing from GMT after prefetch eviction");
@@ -1141,11 +1149,11 @@ PageMapping::accessCMT_LRU(uint64_t lpn, bool isWrite, uint64_t &tick,
     cmt.reserve(cmt.size() + candidates.size() + 1);
 
     cmtOrder.push_front(lpn);
-    cmt.emplace(lpn, std::make_pair(CMTEntry{gmtIt->second, isWrite, false},
+    cmt.emplace(lpn, std::make_pair(CMTEntry{gmtIt->second, isWrite, false, false},
                                     cmtOrder.begin()));
 
-    uint64_t nPref = insertPrefetchBatchLRU(candidates);
-    chargePrefetchDRAM(nPref, tick);
+    uint64_t nPref = insertFillBatchLRU(candidates);
+    chargeWindowFillDRAM(nPref, tick);
 
     if (cmt.size() > cmtCapacity) {
       panic("CMT: occupancy exceeded capacity after prefetch");
@@ -1158,7 +1166,7 @@ PageMapping::accessCMT_LRU(uint64_t lpn, bool isWrite, uint64_t &tick,
   cmtOrder.push_front(lpn);
   auto insertResult = cmt.emplace(
       lpn,
-      std::make_pair(CMTEntry{gmtIt->second, isWrite, false},
+      std::make_pair(CMTEntry{gmtIt->second, isWrite, false, false},
                      cmtOrder.begin()));
 
   return &insertResult.first->second.first.mapping;
@@ -1212,8 +1220,8 @@ void PageMapping::evictOneLFUVictim(uint64_t &tick, bool chargeWriteBack) {
 
   auto evictIt = cmtLFU.find(evictLpn);
   if (evictIt != cmtLFU.end()) {
-    if (evictIt->second.prefetched) {
-      stat.cmtPrefetchEvictedUnused++;
+    if (evictIt->second.fillUnused) {
+      stat.cmtFillEvictedUnused++;
     }
     if (evictIt->second.dirty) {
       table[evictLpn] = evictIt->second.mapping;
@@ -1268,9 +1276,11 @@ PageMapping::accessCMT_LFU(uint64_t lpn, bool isWrite, uint64_t &tick,
     // Mark dirty on write (same as LRU)
     if (isWrite) { entry.dirty = true; }
 
-    if (entry.prefetched && !isGC) {
-      entry.prefetched = false;
-      stat.cmtPrefetchHits++;
+    if (entry.fillOrigin && !isGC) {
+      stat.cmtFillHits++;
+    }
+    if (entry.fillUnused && !isGC) {
+      entry.fillUnused = false;
     }
 
     return &entry.mapping;
@@ -1322,7 +1332,7 @@ PageMapping::accessCMT_LFU(uint64_t lpn, bool isWrite, uint64_t &tick,
     paidMissLatency = true;
   }
 
-  // ── Spatial prefetch (LFU version) ──────────────────────────────────────
+  // ── Window fill (LFU version) ──────────────────────────────────────
   //
   // ORDER IS CRITICAL — same guarantee as the LRU path:
   //   Phase 1: collect candidates
@@ -1335,12 +1345,12 @@ PageMapping::accessCMT_LFU(uint64_t lpn, bool isWrite, uint64_t &tick,
   // condition holds exactly one slot in reserve for the demand entry.
   // ────────────────────────────────────────────────────────────────────────
 
-  if (cmtSpatialPrefetch && !isGC && paidMissLatency) {
-    std::vector<uint64_t> candidates = collectPrefetchCandidates(lpn);
+  if (cmtWindowFill && !isGC && paidMissLatency) {
+    std::vector<uint64_t> candidates = collectFillCandidates(lpn);
 
     if (!candidates.empty()) {
-      stat.cmtPrefetchTriggers++;
-      evictForPrefetchBatch(candidates.size(), tick);
+      stat.cmtFillTriggers++;
+      evictForFillBatch(candidates.size(), tick);
       gmtIt = table.find(lpn);
       if (gmtIt == table.end()) {
         panic("CMT-LFU: demand LPN missing from GMT after prefetch eviction");
@@ -1357,12 +1367,13 @@ PageMapping::accessCMT_LFU(uint64_t lpn, bool isWrite, uint64_t &tick,
     newEntry.dirty = isWrite;
     newEntry.freq = 1;
     newEntry.listIt = cmtFreqBuckets[1].begin();
-    newEntry.prefetched = false;
+    newEntry.fillOrigin = false;
+  newEntry.fillUnused = false;
 
     cmtLFU.emplace(lpn, std::move(newEntry));
 
-    uint64_t nPref = insertPrefetchBatchLFU(candidates);
-    chargePrefetchDRAM(nPref, tick);
+    uint64_t nPref = insertFillBatchLFU(candidates);
+    chargeWindowFillDRAM(nPref, tick);
 
     if (cmtLFU.size() > cmtCapacity) {
       panic("CMT-LFU: occupancy exceeded capacity after prefetch");
@@ -1381,7 +1392,8 @@ PageMapping::accessCMT_LFU(uint64_t lpn, bool isWrite, uint64_t &tick,
   newEntry.dirty      = isWrite;
   newEntry.freq       = 1;
   newEntry.listIt     = cmtFreqBuckets[1].begin();
-  newEntry.prefetched = false;
+  newEntry.fillOrigin = false;
+  newEntry.fillUnused = false;
 
   auto insertResult = cmtLFU.emplace(lpn, std::move(newEntry));
   // ──────────────────────────────────────────────────────────────────────────
@@ -1822,36 +1834,36 @@ void PageMapping::getStatList(std::vector<Stats> &list, std::string prefix) {
   temp.desc = "CMT occupancy at end of simulation (entries used)";
   list.push_back(temp);
 
-  temp.name = prefix + "page_mapping.cmt.prefetch_insertions";
-  temp.desc = "Speculative CMT entries inserted by spatial prefetch";
+  temp.name = prefix + "page_mapping.cmt.fill_insertions";
+  temp.desc = "Speculative CMT entries inserted by window fill";
   list.push_back(temp);
 
-  temp.name = prefix + "page_mapping.cmt.prefetch_hits";
+  temp.name = prefix + "page_mapping.cmt.fill_hits";
   temp.desc = "Prefetched entries hit at least once before eviction";
   list.push_back(temp);
 
-  temp.name = prefix + "page_mapping.cmt.prefetch_evicted_unused";
+  temp.name = prefix + "page_mapping.cmt.fill_evicted_unused";
   temp.desc = "Prefetched entries evicted without ever being hit (wasted)";
   list.push_back(temp);
 
-  temp.name = prefix + "page_mapping.cmt.prefetch_triggers";
-  temp.desc = "Number of times a demand miss initiated a prefetch window";
+  temp.name = prefix + "page_mapping.cmt.fill_triggers";
+  temp.desc = "Number of times a demand miss initiated a fill window";
   list.push_back(temp);
 
-  temp.name = prefix + "page_mapping.cmt.prefetch_accuracy_percent";
+  temp.name = prefix + "page_mapping.cmt.fill_accuracy_percent";
   temp.desc = "Prefetch Accuracy (%)";
   list.push_back(temp);
 
-  temp.name = prefix + "page_mapping.cmt.prefetch_pollution_percent";
+  temp.name = prefix + "page_mapping.cmt.fill_waste_rate_percent";
   temp.desc = "Prefetch Pollution (%)";
   list.push_back(temp);
 
-  temp.name = prefix + "page_mapping.cmt.prefetch_coverage_percent";
+  temp.name = prefix + "page_mapping.cmt.fill_coverage_percent";
   temp.desc = "Prefetch Coverage (%)";
   list.push_back(temp);
 
-  temp.name = prefix + "page_mapping.cmt.prefetch_avg_batch_size";
-  temp.desc = "Average valid LPNs fetched per prefetch window";
+  temp.name = prefix + "page_mapping.cmt.fill_avg_batch_size";
+  temp.desc = "Average valid LPNs fetched per fill window";
   list.push_back(temp);
 }
 
@@ -1882,30 +1894,33 @@ void PageMapping::getStatValues(std::vector<double> &values) {
   values.push_back((double)(cmtCapacity * cmtEntryBytes));
   values.push_back((double)cmtSize());
 
-  double prefetchAccuracy = stat.cmtPrefetchInsertions > 0
-      ? (double)stat.cmtPrefetchHits / (double)stat.cmtPrefetchInsertions * 100.0
+  // Ponytail Bug #1 fix: account for resident fills at reporting time
+  uint64_t totalEvictedUnused = stat.cmtFillEvictedUnused + countResidentFills();
+
+  double fillAccuracy = stat.cmtFillInsertions > 0
+      ? (double)stat.cmtFillHits / (double)stat.cmtFillInsertions * 100.0
       : 0.0;
   
-  double prefetchPollution = stat.cmtEvictions > 0
-      ? (double)stat.cmtPrefetchEvictedUnused / (double)stat.cmtEvictions * 100.0
+  double fillWasteRate = stat.cmtFillInsertions > 0
+      ? (double)totalEvictedUnused / (double)stat.cmtFillInsertions * 100.0
       : 0.0;
   
-  double prefetchCoverage = stat.cmtHits > 0
-      ? (double)stat.cmtPrefetchHits / (double)stat.cmtHits * 100.0
+  double fillCoverage = stat.cmtHits > 0
+      ? (double)stat.cmtFillHits / (double)stat.cmtHits * 100.0
       : 0.0;
   
-  double prefetchAvgBatch = stat.cmtPrefetchTriggers > 0
-      ? (double)stat.cmtPrefetchInsertions / (double)stat.cmtPrefetchTriggers
+  double fillAvgBatch = stat.cmtFillTriggers > 0
+      ? (double)stat.cmtFillInsertions / (double)stat.cmtFillTriggers
       : 0.0;
 
-  values.push_back((double)stat.cmtPrefetchInsertions);
-  values.push_back((double)stat.cmtPrefetchHits);
-  values.push_back((double)stat.cmtPrefetchEvictedUnused);
-  values.push_back((double)stat.cmtPrefetchTriggers);
-  values.push_back(prefetchAccuracy);
-  values.push_back(prefetchPollution);
-  values.push_back(prefetchCoverage);
-  values.push_back(prefetchAvgBatch);
+  values.push_back((double)stat.cmtFillInsertions);
+  values.push_back((double)stat.cmtFillHits);
+  values.push_back((double)totalEvictedUnused);
+  values.push_back((double)stat.cmtFillTriggers);
+  values.push_back(fillAccuracy);
+  values.push_back(fillWasteRate);
+  values.push_back(fillCoverage);
+  values.push_back(fillAvgBatch);
 }
 
 void PageMapping::resetStatValues() {
