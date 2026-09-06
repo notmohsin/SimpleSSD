@@ -1898,7 +1898,7 @@ void PageMapping::getStatValues(std::vector<double> &values) {
   uint64_t totalEvictedUnused = stat.cmtFillEvictedUnused + countResidentFills();
 
   double fillAccuracy = stat.cmtFillInsertions > 0
-      ? (double)stat.cmtFillHits / (double)stat.cmtFillInsertions * 100.0
+      ? (double)(stat.cmtFillInsertions - totalEvictedUnused) / (double)stat.cmtFillInsertions * 100.0
       : 0.0;
   
   double fillWasteRate = stat.cmtFillInsertions > 0
