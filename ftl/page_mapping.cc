@@ -698,15 +698,17 @@ void PageMapping::selectVictimBlock(std::vector<uint32_t> &list,
     weight = std::move(selected);
   }
 
-  // Sort weights
-  std::sort(
-      weight.begin(), weight.end(),
-      [](std::pair<uint32_t, float> a, std::pair<uint32_t, float> b) -> bool {
-        return a.second < b.second;
-      });
-
-  // Select victims from the blocks with the lowest weight
+  // Select victims with the lowest weight (O(N) partition vs full sort)
   nBlocks = MIN(nBlocks, weight.size());
+
+  if (nBlocks > 0 && nBlocks < weight.size()) {
+    std::nth_element(
+        weight.begin(), weight.begin() + nBlocks, weight.end(),
+        [](const std::pair<uint32_t, float> &a,
+           const std::pair<uint32_t, float> &b) {
+          return a.second < b.second;
+        });
+  }
 
   for (uint64_t i = 0; i < nBlocks; i++) {
     list.push_back(weight.at(i).first);
@@ -766,14 +768,31 @@ void PageMapping::doGarbageCollection(std::vector<uint32_t> &blocksToReclaim,
             // Invalidate
             block->second.invalidate(pageIndex, idx);
 
-            // GC also updates mappings — go through CMT for consistency
-            auto &gcMappingData = *accessCMT(lpns.at(idx), true, tick, true);
-            auto &mapping = gcMappingData.at(idx);
+            // GC mapping update: inspect live mapping without polluting the CMT
+            auto *liveMapping = getLiveMapping(lpns.at(idx));
 
+            if (liveMapping == nullptr) {
+              panic("FTL: GC encountered unmapped LPN");
+            }
+
+            auto &mapping = liveMapping->at(idx);
             uint32_t newPageIdx = freeBlock->second.getNextWritePageIndex(idx);
 
             mapping.first = newBlockIdx;
             mapping.second = newPageIdx;
+
+            if (cmtContains(lpns.at(idx))) {
+              if (cmtPolicy == CMT_POLICY_LFU) {
+                cmtLFU[lpns.at(idx)].dirty = true;
+              }
+              else {
+                cmt[lpns.at(idx)].first.dirty = true;
+              }
+              stat.cmtGCHits++;
+            }
+            else {
+              stat.cmtGCMisses++;
+            }
 
             freeBlock->second.write(newPageIdx, lpns.at(idx), idx, beginAt);
 
