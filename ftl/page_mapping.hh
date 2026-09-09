@@ -141,7 +141,7 @@ class PageMapping : public AbstractFTL {
   void evictOneLRUVictim(uint64_t &tick, bool chargeWriteBack = true);
   void evictOneLFUVictim(uint64_t &tick, bool chargeWriteBack = true);
 
-  // Spatial prefetch: one NAND translation-page read already paid
+  // CMT window fill: one NAND translation-page read already paid
   // CMTMissLatency; install neighboring GMT mappings into the CMT.
   // A separate translation-page buffer (DFTL GTD/TP cache) is not modeled —
   // mappings are installed directly into the CMT.
@@ -193,9 +193,9 @@ class PageMapping : public AbstractFTL {
     uint64_t cmtGCHits;         // GC-triggered lookups served from CMT
     uint64_t cmtGCMisses;       // GC-triggered lookups that required GMT read
     uint64_t cmtFillInsertions; // speculative entries inserted
-    uint64_t cmtFillHits;       // prefetched entries later confirmed useful
-    uint64_t cmtFillEvictedUnused; // prefetched entries evicted having never been hit
-    uint64_t cmtFillTriggers;   // Number of times a demand miss initiated a prefetch window
+    uint64_t cmtFillHits;       // window-filled entries later confirmed useful
+    uint64_t cmtFillEvictedUnused; // window-filled entries evicted having never been hit
+    uint64_t cmtFillTriggers;   // demand misses that initiated a window-fill batch
   } stat;
 
   float freeBlockRatio();

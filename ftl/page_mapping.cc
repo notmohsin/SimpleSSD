@@ -98,7 +98,7 @@ PageMapping::PageMapping(ConfigReader &c, Parameter &p, PAL::PAL *l,
              cmtPolicy == CMT_POLICY_LFU ? "LFU" : "LRU", cmtCapacity,
              cmtEntryBytes, bitsetSize, cmtCapacity * cmtEntryBytes);
   debugprint(LOG_FTL_PAGE_MAPPING,
-             "CMT  | Prefetch %s | window %" PRIu64 " LPNs",
+             "CMT  | WindowFill %s | window %" PRIu64 " LPNs",
              cmtWindowFill ? "on" : "off", cmtWindowSize);
 }
 
@@ -249,7 +249,7 @@ void PageMapping::resetCMTStats() {
   stat.cmtFillEvictedUnused = 0;
   stat.cmtFillTriggers = 0;
 
-  // Clear prefetched flag on all resident entries so warmup prefetches
+  // Clear fillOrigin on all resident entries so warmup window-fills
   // don't leak into measurement stats (which would cause accuracy > 100%).
   for (auto &e : cmt) {
     e.second.first.fillOrigin = false;
@@ -899,7 +899,7 @@ std::vector<uint64_t> PageMapping::collectFillCandidates(
 }
 
 void PageMapping::evictForFillBatch(size_t batchSize, uint64_t &tick) {
-  // Prefetch-induced victims still write GMT so mappings stay coherent, but
+  // Window-fill-induced victims still write GMT so mappings stay coherent, but
   // charging CMTWriteBackLatency per entry would serialize hundreds of NAND
   // programs on one miss.  Charge at most one translation-page program if any
   // dirty victim was displaced.
@@ -1144,7 +1144,7 @@ PageMapping::accessCMT_LRU(uint64_t lpn, bool isWrite, uint64_t &tick,
   //   Phase 1: collect candidates
   //   Phase 2: evict room for batch + 1 slot reserved for the demand entry
   //   Phase 3: insert the demand entry (safe — Phase 2 cannot evict it)
-  //   Phase 4: fill prefetch batch at LRU end (lowest eviction priority)
+  //   Phase 4: fill batch at LRU end (lowest eviction priority)
   //
   // The demand entry is inserted AFTER Phase 2 so it can never be chosen
   // as a victim by the batch-evict loop.  The "+1" in Phase 2's condition
@@ -1159,7 +1159,7 @@ PageMapping::accessCMT_LRU(uint64_t lpn, bool isWrite, uint64_t &tick,
       evictForFillBatch(candidates.size(), tick);
       gmtIt = table.find(lpn);
       if (gmtIt == table.end()) {
-        panic("CMT: demand LPN missing from GMT after prefetch eviction");
+        panic("CMT: demand LPN missing from GMT after window-fill eviction");
       }
     }
 
@@ -1175,13 +1175,13 @@ PageMapping::accessCMT_LRU(uint64_t lpn, bool isWrite, uint64_t &tick,
     chargeWindowFillDRAM(nPref, tick);
 
     if (cmt.size() > cmtCapacity) {
-      panic("CMT: occupancy exceeded capacity after prefetch");
+      panic("CMT: occupancy exceeded capacity after window fill");
     }
 
     return cmtMappingOf(lpn);
   }
 
-  // Prefetch disabled (or GC path, or brand-new LPN): plain insert at MRU.
+  // Window fill disabled (or GC path, or brand-new LPN): plain insert at MRU.
   cmtOrder.push_front(lpn);
   auto insertResult = cmt.emplace(
       lpn,
@@ -1357,7 +1357,7 @@ PageMapping::accessCMT_LFU(uint64_t lpn, bool isWrite, uint64_t &tick,
   //   Phase 1: collect candidates
   //   Phase 2: evict room for batch + 1 slot reserved for the demand entry
   //   Phase 3: insert the demand entry (after eviction — cannot be a victim)
-  //   Phase 4: fill prefetch batch at freq=1 (lowest eviction priority)
+  //   Phase 4: fill batch at freq=1 (lowest eviction priority)
   //
   // The demand entry is inserted in Phase 3, AFTER Phase 2's eviction loop,
   // so Phase 2 can never choose it as a victim.  The "+1" in Phase 2's
@@ -1372,7 +1372,7 @@ PageMapping::accessCMT_LFU(uint64_t lpn, bool isWrite, uint64_t &tick,
       evictForFillBatch(candidates.size(), tick);
       gmtIt = table.find(lpn);
       if (gmtIt == table.end()) {
-        panic("CMT-LFU: demand LPN missing from GMT after prefetch eviction");
+        panic("CMT-LFU: demand LPN missing from GMT after window-fill eviction");
       }
     }
 
@@ -1395,13 +1395,13 @@ PageMapping::accessCMT_LFU(uint64_t lpn, bool isWrite, uint64_t &tick,
     chargeWindowFillDRAM(nPref, tick);
 
     if (cmtLFU.size() > cmtCapacity) {
-      panic("CMT-LFU: occupancy exceeded capacity after prefetch");
+      panic("CMT-LFU: occupancy exceeded capacity after window fill");
     }
 
     return cmtMappingOf(lpn);
   }
 
-  // Prefetch disabled (or GC path, or brand-new LPN): plain insert at freq=1.
+  // Window fill disabled (or GC path, or brand-new LPN): plain insert at freq=1.
   // ── Insertion: new entry always starts at frequency = 1 ──────────────────
   cmtMinFreq = 1;
   cmtFreqBuckets[1].push_front(lpn);
@@ -1858,11 +1858,11 @@ void PageMapping::getStatList(std::vector<Stats> &list, std::string prefix) {
   list.push_back(temp);
 
   temp.name = prefix + "page_mapping.cmt.fill_hits";
-  temp.desc = "Prefetched entries hit at least once before eviction";
+  temp.desc = "Window-filled entries hit at least once before eviction";
   list.push_back(temp);
 
   temp.name = prefix + "page_mapping.cmt.fill_evicted_unused";
-  temp.desc = "Prefetched entries evicted without ever being hit (wasted)";
+  temp.desc = "Window-filled entries evicted without ever being hit (wasted)";
   list.push_back(temp);
 
   temp.name = prefix + "page_mapping.cmt.fill_triggers";
@@ -1870,15 +1870,15 @@ void PageMapping::getStatList(std::vector<Stats> &list, std::string prefix) {
   list.push_back(temp);
 
   temp.name = prefix + "page_mapping.cmt.fill_accuracy_percent";
-  temp.desc = "Prefetch Accuracy (%)";
+  temp.desc = "Window-fill accuracy (%)";
   list.push_back(temp);
 
   temp.name = prefix + "page_mapping.cmt.fill_waste_rate_percent";
-  temp.desc = "Prefetch Pollution (%)";
+  temp.desc = "Window-fill waste (%)";
   list.push_back(temp);
 
   temp.name = prefix + "page_mapping.cmt.fill_coverage_percent";
-  temp.desc = "Prefetch Coverage (%)";
+  temp.desc = "Window-fill coverage (%)";
   list.push_back(temp);
 
   temp.name = prefix + "page_mapping.cmt.fill_avg_batch_size";
