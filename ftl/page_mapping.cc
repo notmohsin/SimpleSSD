@@ -289,7 +289,8 @@ bool PageMapping::initialize() {
 
   if (nPagesToWarmup + nPagesToInvalidate > maxPagesBeforeGC) {
     warn("ftl: Too high filling ratio. Adjusting invalidPageRatio.");
-    nPagesToInvalidate = maxPagesBeforeGC - nPagesToWarmup;
+    nPagesToInvalidate =
+        (maxPagesBeforeGC > nPagesToWarmup) ? (maxPagesBeforeGC - nPagesToWarmup) : 0;
   }
 
   debugprint(LOG_FTL_PAGE_MAPPING, "Total logical pages: %" PRIu64,
@@ -781,6 +782,16 @@ void PageMapping::doGarbageCollection(std::vector<uint32_t> &blocksToReclaim,
             mapping.first = newBlockIdx;
             mapping.second = newPageIdx;
 
+            // Only count GC hit/miss once per unique LPN per superpage relocation
+            // to maintain 1-to-1 parity with user-access granularity.
+            bool countedThisLpn = false;
+            for (uint32_t prev = 0; prev < idx; prev++) {
+              if (bit.test(prev) && lpns.at(prev) == lpns.at(idx)) {
+                countedThisLpn = true;
+                break;
+              }
+            }
+
             if (cmtContains(lpns.at(idx))) {
               if (cmtPolicy == CMT_POLICY_LFU) {
                 cmtLFU[lpns.at(idx)].dirty = true;
@@ -788,10 +799,14 @@ void PageMapping::doGarbageCollection(std::vector<uint32_t> &blocksToReclaim,
               else {
                 cmt[lpns.at(idx)].first.dirty = true;
               }
-              stat.cmtGCHits++;
+              if (!countedThisLpn) {
+                stat.cmtGCHits++;
+              }
             }
             else {
-              stat.cmtGCMisses++;
+              if (!countedThisLpn) {
+                stat.cmtGCMisses++;
+              }
             }
 
             freeBlock->second.write(newPageIdx, lpns.at(idx), idx, beginAt);
@@ -1858,7 +1873,7 @@ void PageMapping::getStatList(std::vector<Stats> &list, std::string prefix) {
   list.push_back(temp);
 
   temp.name = prefix + "page_mapping.cmt.fill_hits";
-  temp.desc = "Window-filled entries hit at least once before eviction";
+  temp.desc = "Cumulative hits served by window-filled entries before eviction";
   list.push_back(temp);
 
   temp.name = prefix + "page_mapping.cmt.fill_evicted_unused";
