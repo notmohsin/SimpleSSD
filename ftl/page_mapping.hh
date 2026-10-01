@@ -21,6 +21,7 @@
 #define __FTL_PAGE_MAPPING__
 
 #include <cinttypes>
+#include <limits>
 #include <list>
 #include <unordered_map>
 #include <vector>
@@ -74,6 +75,7 @@ class PageMapping : public AbstractFTL {
 
   bool cmtWindowFill;
   uint64_t cmtWindowSize;
+  uint64_t lastUserDemandLpn;
 
   // ── LRU policy state ───────────────────────────────────────
   // Evicts the entry that was accessed least recently.
@@ -146,7 +148,8 @@ class PageMapping : public AbstractFTL {
   // A separate translation-page buffer (DFTL GTD/TP cache) is not modeled —
   // mappings are installed directly into the CMT.
   bool cmtContains(uint64_t lpn) const;
-  std::vector<uint64_t> collectFillCandidates(uint64_t lpn) const;
+  std::vector<uint64_t> collectFillCandidates(uint64_t lpn,
+                                              uint64_t maxBatch) const;
   void evictForFillBatch(size_t batchSize, uint64_t &tick);
   uint64_t insertFillBatchLRU(const std::vector<uint64_t> &candidates);
   uint64_t insertFillBatchLFU(const std::vector<uint64_t> &candidates);

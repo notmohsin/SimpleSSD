@@ -24,6 +24,8 @@
 #include <list>
 #include <random>
 
+#include "ftl/cmt_fill_budget.hh"
+
 #include "util/algorithm.hh"
 #include "util/bitset.hh"
 
@@ -88,6 +90,7 @@ PageMapping::PageMapping(ConfigReader &c, Parameter &p, PAL::PAL *l,
 
   cmtWindowFill = conf.readBoolean(CONFIG_FTL, FTL_CMT_WINDOW_FILL);
   cmtWindowSize = conf.readUint(CONFIG_FTL, FTL_CMT_WINDOW_SIZE);
+  lastUserDemandLpn = std::numeric_limits<uint64_t>::max();
   // NAND flash program latency for dirty write-back on eviction
   cmtWriteBackLatency = conf.readUint(CONFIG_FTL, FTL_CMT_WRITEBACK_LATENCY);
   cmtMinFreq = 0;
@@ -144,6 +147,7 @@ void PageMapping::flushCMT() {
   cmtLFU.clear();
   cmtFreqBuckets.clear();
   cmtMinFreq = 0;
+  lastUserDemandLpn = std::numeric_limits<uint64_t>::max();
 }
 
 void PageMapping::repairLFUMinFreq() {
@@ -887,9 +891,9 @@ bool PageMapping::cmtContains(uint64_t lpn) const {
 }
 
 std::vector<uint64_t> PageMapping::collectFillCandidates(
-    uint64_t lpn) const {
+    uint64_t lpn, uint64_t maxBatch) const {
   std::vector<uint64_t> candidates;
-  if (cmtWindowSize == 0) {
+  if (cmtWindowSize == 0 || maxBatch == 0) {
     return candidates;
   }
 
@@ -899,25 +903,25 @@ std::vector<uint64_t> PageMapping::collectFillCandidates(
 
   for (uint64_t candidateLpn = groupStart; candidateLpn < groupEnd;
        ++candidateLpn) {
+    if (candidates.size() >= maxBatch) {
+      break;
+    }
     if (candidateLpn == lpn) continue;
     if (cmtContains(candidateLpn)) continue;
     if (table.find(candidateLpn) == table.end()) continue;
     candidates.push_back(candidateLpn);
   }
 
-  uint64_t maxBatch = cmtCapacity > 1 ? cmtCapacity - 1 : 0;
-  if (candidates.size() > maxBatch) {
-    candidates.resize(maxBatch);
-  }
-
   return candidates;
 }
 
 void PageMapping::evictForFillBatch(size_t batchSize, uint64_t &tick) {
-  // Window-fill-induced victims still write GMT so mappings stay coherent, but
-  // charging CMTWriteBackLatency per entry would serialize hundreds of NAND
-  // programs on one miss.  Charge at most one translation-page program if any
-  // dirty victim was displaced.
+  // Window-fill-induced victims still write GMT so mappings stay coherent.
+  // Charge at most one translation-page program if any dirty victim was
+  // displaced (DFTL packs many LPNs per translation page).  This coalescing
+  // is an acceptable simplification: it understates write-back cost when a
+  // random miss would otherwise evict many dirty entries.  Do not treat the
+  // resulting simulated latency as a full-system NAND translation-page model.
   uint64_t dirtyBefore = stat.cmtDirtyEvictions;
 
   if (cmtPolicy == CMT_POLICY_LFU) {
@@ -1167,7 +1171,14 @@ PageMapping::accessCMT_LRU(uint64_t lpn, bool isWrite, uint64_t &tick,
   // ────────────────────────────────────────────────────────────────────────
 
   if (cmtWindowFill && !isGC && paidMissLatency) {
-    std::vector<uint64_t> candidates = collectFillCandidates(lpn);
+    const bool sequentialWindow =
+        lastUserDemandLpn != std::numeric_limits<uint64_t>::max() &&
+        (lpn / cmtWindowSize) == (lastUserDemandLpn / cmtWindowSize);
+    lastUserDemandLpn = lpn;
+
+    const uint64_t budget = windowFillBudget(
+        cmt.size(), cmtCapacity, cmtWindowSize, sequentialWindow);
+    std::vector<uint64_t> candidates = collectFillCandidates(lpn, budget);
 
     if (!candidates.empty()) {
       stat.cmtFillTriggers++;
@@ -1380,7 +1391,14 @@ PageMapping::accessCMT_LFU(uint64_t lpn, bool isWrite, uint64_t &tick,
   // ────────────────────────────────────────────────────────────────────────
 
   if (cmtWindowFill && !isGC && paidMissLatency) {
-    std::vector<uint64_t> candidates = collectFillCandidates(lpn);
+    const bool sequentialWindow =
+        lastUserDemandLpn != std::numeric_limits<uint64_t>::max() &&
+        (lpn / cmtWindowSize) == (lastUserDemandLpn / cmtWindowSize);
+    lastUserDemandLpn = lpn;
+
+    const uint64_t budget = windowFillBudget(
+        cmtLFU.size(), cmtCapacity, cmtWindowSize, sequentialWindow);
+    std::vector<uint64_t> candidates = collectFillCandidates(lpn, budget);
 
     if (!candidates.empty()) {
       stat.cmtFillTriggers++;
